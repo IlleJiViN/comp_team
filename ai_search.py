@@ -5,7 +5,6 @@ import sys
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any
 
-import faiss
 import numpy as np
 import torch
 from fastapi import FastAPI, Request, status
@@ -13,6 +12,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import create_engine, text
+
+from categories import CATEGORY_DESCRIPTIONS
 
 # Reconfigure stdout/stderr encoding for UTF-8 on Windows
 if sys.stdout.encoding != 'utf-8':
@@ -45,22 +46,25 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     return R * c
 
 # ==============================================================================
-# [Architectural Design Intention - High-Performance PostGIS Hybrid Search]
-# 1. Monolithic In-Memory & PostGIS Spatial Filtering:
-#    - With a real-world dataset of 671,650 places, holding all vectors in memory is
-#      impractical and makes startup slow (~hours to embed 670k rows on CPU).
-#    - Instead, we leverage the PostGIS GIST spatial index in our Docker container.
-#    - We retrieve the top 100 closest places within the user's radius using a highly 
-#      optimized PostGIS spatial query in less than 5ms.
+# [Architectural Design v4 - Decomposed Category Similarity Matching]
 #
-# 2. On-the-fly Transformer Embedding on Filtered Candidates:
-#    - We batch encode the 100 candidate descriptions on-the-fly using ko-sroberta on CPU.
-#    - Computing embeddings for 100 candidates takes ~50ms, allowing total search latency
-#      to stay well below the 200ms target tail latency budget.
+# Problem with v3 (Single Sentence Embedding):
+#   - Entire place description (name + category hierarchy + category description,
+#     200~300 chars) was compressed into a single 768-dim vector.
+#   - This causes semantic dilution: query-irrelevant noise in the text
+#     degrades similarity scores and ranking discriminability.
 #
-# 3. Thread & Memory Management (i5-13420H, 16GB RAM):
-#    - Thread pool tuned to 4 threads for optimal core scheduling on hybrid CPUs.
-#    - Strict application of `torch.no_grad()` to completely prevent memory leaks.
+# v4 Solution (Decomposed Category Similarity):
+#   1. Pre-cache category prototype vectors at startup (~50 categories).
+#   2. At search time, match query against category prototypes first.
+#   3. Use matched categories as a PostGIS filter (WHERE category IN ...).
+#   4. Compute name similarity for fine-grained ranking within categories.
+#   5. Final score = α × category_sim + β × name_sim (α=0.6, β=0.4).
+#
+# Benefits:
+#   - Eliminates semantic dilution by comparing short, focused text units.
+#   - DB queries become more targeted (only relevant categories).
+#   - No DB schema changes or re-indexing required.
 # ==============================================================================
 
 # Thread tuning for hybrid core CPU (i5-13420H)
@@ -72,6 +76,10 @@ MODEL_NAME = "jhgan/ko-sroberta-multitask"
 DEVICE = "cpu"
 DIMENSION = 768
 DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/spotsync"
+
+# Scoring weights
+ALPHA_CATEGORY = 0.6   # Weight for category similarity
+BETA_NAME = 0.4        # Weight for name similarity
 
 # ==============================================================================
 # [MOCK DATASET]
@@ -144,12 +152,19 @@ class SearchRequest(BaseModel):
         description="Search radius in meters.",
         example=1000.0
     )
-    similarity_threshold: float = Field(
-        default=0.70,
+    category_threshold: float = Field(
+        default=0.45,
         ge=0.0,
         le=1.0,
-        description="Minimum cosine similarity threshold to classify and return a place.",
-        example=0.70
+        description="Minimum cosine similarity to consider a category relevant.",
+        example=0.45
+    )
+    similarity_threshold: float = Field(
+        default=0.40,
+        ge=0.0,
+        le=1.0,
+        description="Minimum final combined score threshold to return a place.",
+        example=0.40
     )
     top_k: int = Field(
         default=3,
@@ -168,10 +183,13 @@ class PlaceSearchResult(BaseModel):
     description: str = Field(..., description="Detailed description of the location.")
     address: str = Field("", description="Street address of the location.")
     distance_meters: float = Field(..., description="Geographical distance in meters from the user.")
-    similarity_score: float = Field(..., description="Cosine similarity score (0.0 to 1.0).")
+    similarity_score: float = Field(..., description="Combined similarity score (0.0 to 1.0).")
+    category_score: float = Field(0.0, description="Category prototype similarity score.")
+    name_score: float = Field(0.0, description="Place name similarity score.")
 
 class SearchResponse(BaseModel):
     query: str = Field(..., description="The original query string.")
+    matched_categories: List[str] = Field(default=[], description="Categories that matched the query intent.")
     results: List[PlaceSearchResult] = Field(..., description="List of matched places ranked by relevance within the radius.")
     latency_ms: float = Field(..., description="Search process latency in milliseconds.")
 
@@ -181,9 +199,10 @@ class SearchResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """
     1. Loads the Embedding Model to app.state.model.
-    2. Establishes a database connection pool to PostgreSQL / PostGIS container.
+    2. Pre-caches category prototype vectors for decomposed similarity matching.
+    3. Establishes a database connection pool to PostgreSQL / PostGIS container.
     """
-    print(f"[STARTUP] Initializing SpotSync AI Hybrid Pipeline...")
+    print(f"[STARTUP] Initializing SpotSync AI v4 (Decomposed Category Similarity)...")
     start_time = time.perf_counter()
     
     try:
@@ -193,7 +212,21 @@ async def lifespan(app: FastAPI):
         # Warm up model to cache torch variables
         _ = model.encode("웜업", convert_to_numpy=True)
         
-        # Step 2: Establish DB Connection
+        # Step 2: Pre-cache category prototype vectors
+        print(f"[STARTUP] Encoding {len(CATEGORY_DESCRIPTIONS)} category prototypes...")
+        category_names = list(CATEGORY_DESCRIPTIONS.keys())
+        category_texts = list(CATEGORY_DESCRIPTIONS.values())
+        
+        with torch.no_grad():
+            category_vectors = model.encode(
+                category_texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype('float32')  # Shape: (num_categories, 768)
+        
+        print(f"[STARTUP] Category prototype matrix cached: {category_vectors.shape}")
+        
+        # Step 3: Establish DB Connection
         print(f"[STARTUP] Connecting to PostgreSQL/PostGIS DB...")
         engine = create_engine(DATABASE_URL)
         
@@ -205,9 +238,11 @@ async def lifespan(app: FastAPI):
         # Assign variables to global app state
         app.state.model = model
         app.state.engine = engine
+        app.state.category_names = category_names
+        app.state.category_vectors = category_vectors
         
         duration = (time.perf_counter() - start_time) * 1000
-        print(f"[STARTUP] Hybrid PostGIS-Semantic search engine initialized successfully in {duration:.2f}ms.")
+        print(f"[STARTUP] v4 Decomposed Category Similarity engine initialized in {duration:.2f}ms.")
     except Exception as e:
         print(f"[FATAL STARTUP ERROR] Failed initialization: {str(e)}")
         raise e
@@ -228,8 +263,8 @@ async def lifespan(app: FastAPI):
 # Instantiate FastAPI Server
 app = FastAPI(
     title="SpotSync AI Semantic Search & Recommendation Engine",
-    description="Hybrid PostGIS spatial filter & on-the-fly FAISS microservice for massive scale place search.",
-    version="2.0.0",
+    description="v4 Decomposed Category Similarity: category-level prototype matching + name-level fine ranking.",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -237,17 +272,24 @@ app = FastAPI(
     "/search",
     response_model=SearchResponse,
     status_code=status.HTTP_200_OK,
-    summary="Semantic Location Search",
-    description="Transforms natural language search intent into vectors and retrieves top matching locations via PostGIS and real-time FAISS scoring."
+    summary="Semantic Location Search (v4 Decomposed Category Similarity)",
+    description="Matches query intent against category prototypes, filters candidates via PostGIS, then ranks by name similarity."
 )
 async def semantic_search(request: Request, body: SearchRequest):
     """
-    1. Queries PostGIS for candidate places within the user-specified radius.
-    2. Performs on-the-fly semantic similarity ranking on closest candidate places.
-    3. Returns candidates sorted by similarity score.
+    v4 Decomposed Category Similarity Pipeline:
+    1. Encode query vector.
+    2. Match query against pre-cached category prototype vectors.
+    3. Filter categories above threshold → use as PostGIS category filter.
+    4. Query PostGIS for spatial + category-filtered candidates.
+    5. Batch-encode candidate names → compute name similarity.
+    6. Final score = α × category_sim + β × name_sim.
+    7. Return top_k results sorted by final score.
     """
     model: SentenceTransformer = request.app.state.model
     engine = request.app.state.engine
+    category_names: List[str] = request.app.state.category_names
+    category_vectors: np.ndarray = request.app.state.category_vectors
     
     if not model or not engine:
         return JSONResponse(
@@ -258,181 +300,139 @@ async def semantic_search(request: Request, body: SearchRequest):
     start_time = time.perf_counter()
     
     try:
-        # Convert radius in meters to degrees approximately (1 degree is approx 111,000 meters)
-        # To be safe and inclusive, we add a 10% buffer to expand the bounding box
-        degrees = (body.radius_meters / 111000.0) * 1.1
-        
-        # 1. Parse search query terms dynamically for pre-filtering
-        import re
-        stop_words = {
-            "좋은", "편한", "잘되는", "진짜", "매우", "가장", "추천", "곳", "위치한", "검색", 
-            "하기", "가서", "들고", "가기", "쉬운", "이쁜", "예쁜", "맛있는", "조용한", 
-            "분위기", "성능", "최고", "조용하고", "편안한", "아늑한", "깔끔한", "근처", "가까운"
-        }
-        
-        # Split by non-alphanumeric characters
-        query_terms = [t for t in re.split(r'[^a-zA-Z0-9가-힣]+', body.query.lower()) if t]
-        filtered_terms = [t for t in query_terms if t not in stop_words and len(t) > 1]
-        
-        # Fallback to longer terms if all are stop words
-        if not filtered_terms:
-            filtered_terms = [t for t in query_terms if len(t) > 1]
-            
-        sql_params = {
-            "lon": body.user_longitude,
-            "lat": body.user_latitude,
-            "degrees": degrees
-        }
-        
-        base_where = [
-            "location && ST_Expand(ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)",
-            "ST_DWithin(location, ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)",
-            "embedding_text_v3 IS NOT NULL AND embedding_text_v3 != ''"
-        ]
-        
-        candidates = []
-        
-        # Step A: Perform dynamic term matching on PostgreSQL/PostGIS
-        if filtered_terms:
-            term_clauses = []
-            for i, term in enumerate(filtered_terms):
-                term_clauses.append(f"name ILIKE :term_{i}")
-                term_clauses.append(f"category ILIKE :term_{i}")
-                term_clauses.append(f"embedding_text_v3 ILIKE :term_{i}")
-                sql_params[f"term_{i}"] = f"%{term}%"
-                
-            term_where = base_where + ["(" + " OR ".join(term_clauses) + ")"]
-            term_where_str = " AND ".join(term_where)
-            
-            sql_term = text(f"""
-                SELECT id, name, category, latitude, longitude, address, embedding_text_v3, embedding_vector_v3,
-                       ST_Distance(location::geography, ST_SetSRID(ST_Point(:lon, :lat), 4326)::geography) AS distance_meters
-                FROM places
-                WHERE {term_where_str}
-                ORDER BY distance_meters ASC
-                LIMIT 250
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(sql_term, sql_params)
-                for r in result:
-                    candidates.append({
-                        "id": r[0],
-                        "name": r[1],
-                        "category": r[2],
-                        "latitude": r[3],
-                        "longitude": r[4],
-                        "address": r[5],
-                        "description": r[6],
-                        "embedding_vector": r[7],
-                        "distance_meters": float(r[8])
-                    })
-                    
-        # Step B: Geographical backfill if term matching was too restrictive
-        if len(candidates) < 100:
-            needed = 150 - len(candidates)
-            exclude_ids = [c["id"] for c in candidates]
-            
-            exclude_clause = ""
-            if exclude_ids:
-                exclude_clause = " AND id NOT IN (" + ",".join(map(str, exclude_ids)) + ")"
-                
-            fallback_where_str = " AND ".join(base_where) + exclude_clause
-            sql_fallback = text(f"""
-                SELECT id, name, category, latitude, longitude, address, embedding_text_v3, embedding_vector_v3,
-                       ST_Distance(location::geography, ST_SetSRID(ST_Point(:lon, :lat), 4326)::geography) AS distance_meters
-                FROM places
-                WHERE {fallback_where_str}
-                ORDER BY distance_meters ASC
-                LIMIT {needed}
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(sql_fallback, sql_params)
-                for r in result:
-                    candidates.append({
-                        "id": r[0],
-                        "name": r[1],
-                        "category": r[2],
-                        "latitude": r[3],
-                        "longitude": r[4],
-                        "address": r[5],
-                        "description": r[6],
-                        "embedding_vector": r[7],
-                        "distance_meters": float(r[8])
-                    })
-                
-        # If no places are within the radius, return immediately
-        if not candidates:
-            latency = (time.perf_counter() - start_time) * 1000
-            return SearchResponse(
-                query=body.query,
-                results=[],
-                latency_ms=round(latency, 2)
-            )
-            
-        # Step 2: Encode user query (ensure normalization matches indexed data)
+        # ==================================================================
+        # Step 1: Encode query vector
+        # ==================================================================
         with torch.no_grad():
             query_vector = model.encode(
                 [body.query],
                 convert_to_numpy=True,
                 normalize_embeddings=True
             ).astype('float32')  # Shape: (1, 768)
-            
-        # Step 3: Retrieve or compute candidate embeddings
-        candidate_embeddings_list = []
-        needs_encoding_indices = []
-        needs_encoding_texts = []
         
-        for idx, c in enumerate(candidates):
-            if c.get("embedding_vector") is not None:
-                vec = np.array(c["embedding_vector"], dtype='float32')
-                # Check that dimension matches
-                if vec.shape == (DIMENSION,):
-                    candidate_embeddings_list.append(vec)
-                    continue
-            
-            # Placeholder for on-the-fly encoding
-            desc = c.get("description")
-            if desc is None or not isinstance(desc, str) or desc.strip() == "":
-                desc = f"{c.get('name', '')} {c.get('category', '')}".strip()
-                
-            candidate_embeddings_list.append(None)
-            needs_encoding_indices.append(idx)
-            needs_encoding_texts.append(desc)
-            
-        if needs_encoding_texts:
-            with torch.no_grad():
-                encoded_vectors = model.encode(
-                    needs_encoding_texts,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True
-                ).astype('float32')
-            for i, idx in enumerate(needs_encoding_indices):
-                candidate_embeddings_list[idx] = encoded_vectors[i]
-                
-        candidate_embeddings = np.stack(candidate_embeddings_list).astype('float32')
-            
-        # Step 4: Compute Cosine Similarity (Inner Product)
-        scores = np.dot(candidate_embeddings, query_vector.T).squeeze(axis=-1)
-        scores = np.atleast_1d(scores)
+        # ==================================================================
+        # Step 2: Category prototype matching
+        # ==================================================================
+        # Compute cosine similarity between query and all category prototypes
+        # category_vectors shape: (num_categories, 768), query_vector shape: (1, 768)
+        cat_scores = np.dot(category_vectors, query_vector.T).squeeze()  # Shape: (num_categories,)
         
-        # Combine candidate details, calculated distance, and similarity score
+        # Select categories above threshold
+        matched_categories = []
+        category_sim_map = {}  # category_name -> similarity_score
+        
+        for i, score in enumerate(cat_scores):
+            if float(score) >= body.category_threshold:
+                matched_categories.append(category_names[i])
+                category_sim_map[category_names[i]] = float(score)
+        
+        # Sort matched categories by score for logging
+        matched_categories.sort(key=lambda c: category_sim_map[c], reverse=True)
+        
+        # If no categories match, return empty (query is too vague or unrelated)
+        if not matched_categories:
+            latency = (time.perf_counter() - start_time) * 1000
+            return SearchResponse(
+                query=body.query,
+                matched_categories=[],
+                results=[],
+                latency_ms=round(latency, 2)
+            )
+        
+        # ==================================================================
+        # Step 3: PostGIS spatial + category-filtered query
+        # ==================================================================
+        degrees = (body.radius_meters / 111000.0) * 1.1
+        
+        # Build category IN clause with parameterized values
+        cat_placeholders = ", ".join([f":cat_{i}" for i in range(len(matched_categories))])
+        sql_params = {
+            "lon": body.user_longitude,
+            "lat": body.user_latitude,
+            "degrees": degrees
+        }
+        for i, cat in enumerate(matched_categories):
+            sql_params[f"cat_{i}"] = cat
+        
+        sql_query = text(f"""
+            SELECT id, name, category, latitude, longitude, address,
+                   ST_Distance(location::geography, ST_SetSRID(ST_Point(:lon, :lat), 4326)::geography) AS distance_meters
+            FROM places
+            WHERE location && ST_Expand(ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)
+              AND ST_DWithin(location, ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)
+              AND category IN ({cat_placeholders})
+            ORDER BY distance_meters ASC
+            LIMIT 200
+        """)
+        
+        candidates = []
+        with engine.connect() as conn:
+            result = conn.execute(sql_query, sql_params)
+            for r in result:
+                candidates.append({
+                    "id": r[0],
+                    "name": r[1],
+                    "category": r[2],
+                    "latitude": r[3],
+                    "longitude": r[4],
+                    "address": r[5],
+                    "distance_meters": float(r[6])
+                })
+        
+        if not candidates:
+            latency = (time.perf_counter() - start_time) * 1000
+            return SearchResponse(
+                query=body.query,
+                matched_categories=matched_categories,
+                results=[],
+                latency_ms=round(latency, 2)
+            )
+        
+        # ==================================================================
+        # Step 4: Batch-encode candidate names → compute name similarity
+        # ==================================================================
+        candidate_names = [c["name"] for c in candidates]
+        
+        with torch.no_grad():
+            name_vectors = model.encode(
+                candidate_names,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype('float32')  # Shape: (num_candidates, 768)
+        
+        # Compute name similarity scores
+        name_scores = np.dot(name_vectors, query_vector.T).squeeze()
+        name_scores = np.atleast_1d(name_scores)
+        
+        # ==================================================================
+        # Step 5: Compute final combined score and rank
+        # ==================================================================
         scored_candidates = []
-        for candidate, score in zip(candidates, scores):
-            if float(score) >= body.similarity_threshold:
+        for idx, candidate in enumerate(candidates):
+            cat_sim = category_sim_map.get(candidate["category"], 0.0)
+            name_sim = float(name_scores[idx])
+            
+            # Weighted combination
+            final_score = ALPHA_CATEGORY * cat_sim + BETA_NAME * max(name_sim, 0.0)
+            
+            if final_score >= body.similarity_threshold:
                 scored_candidates.append({
                     "candidate": candidate,
-                    "score": float(score)
+                    "final_score": final_score,
+                    "cat_score": cat_sim,
+                    "name_score": name_sim
                 })
-            
-        # Step 5: Rank classified candidates by similarity score in descending order
-        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
         
-        # Assemble response search results for top_k
+        # Sort by final score descending
+        scored_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+        
+        # ==================================================================
+        # Step 6: Assemble response
+        # ==================================================================
         search_results = []
         for item in scored_candidates[:body.top_k]:
             c = item["candidate"]
+            cat_desc = CATEGORY_DESCRIPTIONS.get(c["category"], "")
             search_results.append(
                 PlaceSearchResult(
                     place_id=c["id"],
@@ -440,10 +440,12 @@ async def semantic_search(request: Request, body: SearchRequest):
                     category=c["category"],
                     latitude=c["latitude"],
                     longitude=c["longitude"],
-                    description=c["description"],
+                    description=cat_desc,
                     address=c.get("address", ""),
                     distance_meters=round(c["distance_meters"], 1),
-                    similarity_score=item["score"]
+                    similarity_score=round(item["final_score"], 4),
+                    category_score=round(item["cat_score"], 4),
+                    name_score=round(item["name_score"], 4)
                 )
             )
             
@@ -451,11 +453,14 @@ async def semantic_search(request: Request, body: SearchRequest):
         
         return SearchResponse(
             query=body.query,
+            matched_categories=matched_categories,
             results=search_results,
             latency_ms=round(latency, 2)
         )
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": f"Search execution failure: {str(e)}"}
@@ -463,13 +468,12 @@ async def semantic_search(request: Request, body: SearchRequest):
 
 
 # ==============================================================================
-# [BENCHMARK RUNNER & INTEGRATION TEST]
-# Runs manual offline builds of the FAISS index and measures query matching
-# accuracy and performance latency profile.
+# [BENCHMARK RUNNER - v4 Decomposed Category Similarity]
+# Tests category matching accuracy, name-level ranking, and latency profile.
 # ==============================================================================
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print("      SpotSync AI Semantic Search & FAISS Match Accuracy Benchmark")
+    print("      SpotSync AI v4 - Decomposed Category Similarity Benchmark")
     print("="*80)
     
     # 1. Setup local resources
@@ -478,17 +482,23 @@ if __name__ == "__main__":
     bench_model = SentenceTransformer(MODEL_NAME, device=DEVICE)
     print(f"Model loaded in: {((time.perf_counter() - t0)*1000):.2f} ms")
     
-    # 2. Index building
-    print("Encoding mock database descriptions...")
-    descriptions = [p["description"] for p in MOCK_PLACES]
-    with torch.no_grad():
-        embeddings = bench_model.encode(descriptions, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
-        
-    bench_index = faiss.IndexFlatIP(DIMENSION)
-    bench_index.add(embeddings)
-    print(f"FAISS local Index successfully built with {bench_index.ntotal} vectors.")
+    # 2. Build category prototype vectors
+    print(f"Encoding {len(CATEGORY_DESCRIPTIONS)} category prototypes...")
+    cat_names = list(CATEGORY_DESCRIPTIONS.keys())
+    cat_texts = list(CATEGORY_DESCRIPTIONS.values())
     
-    # 3. Test queries for intent verification
+    with torch.no_grad():
+        cat_vectors = bench_model.encode(cat_texts, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+    print(f"Category prototype matrix: {cat_vectors.shape}")
+    
+    # 3. Encode mock place names
+    mock_names = [p["name"] for p in MOCK_PLACES]
+    mock_categories = [p["category"] for p in MOCK_PLACES]
+    
+    with torch.no_grad():
+        mock_name_vectors = bench_model.encode(mock_names, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+    
+    # 4. Test queries
     test_scenarios = [
         {"query": "드럼이랑 마이크 성능 좋은 방음 잘되는 음악 합주실", "expected": "싱크사운드 신촌점"},
         {"query": "노트북 들고 공부하기 편한 조용하고 편안한 카페", "expected": "카페 조용한 공간"},
@@ -496,9 +506,9 @@ if __name__ == "__main__":
         {"query": "혼자 가서 보컬 연습하고 마이크 녹음하기 조용한 스튜디오", "expected": "스타 보컬 스튜디오"}
     ]
     
-    # 4. Run verification and calculate performance latency
-    print("\nRunning Verification Queries...")
-    print("-" * 65)
+    # 5. Run v4 decomposed benchmark
+    print("\nRunning v4 Decomposed Category Similarity Verification...")
+    print("-" * 80)
     
     success_count = 0
     all_latencies = []
@@ -510,15 +520,45 @@ if __name__ == "__main__":
         
         with torch.no_grad():
             q_vec = bench_model.encode([q], convert_to_numpy=True, normalize_embeddings=True).astype('float32')
-            scores, indices = bench_index.search(q_vec, 1)
-            
+        
+        # Step A: Category matching
+        cat_scores = np.dot(cat_vectors, q_vec.T).squeeze()
+        matched_cats = []
+        cat_sim_map = {}
+        for i, score in enumerate(cat_scores):
+            if float(score) >= 0.45:
+                matched_cats.append(cat_names[i])
+                cat_sim_map[cat_names[i]] = float(score)
+        
+        # Step B: Filter mock places by matched categories
+        filtered_indices = [i for i, c in enumerate(mock_categories) if c in cat_sim_map]
+        
+        if not filtered_indices:
+            # Fallback: use all places
+            filtered_indices = list(range(len(MOCK_PLACES)))
+        
+        # Step C: Compute name similarity for filtered places
+        filtered_name_vecs = mock_name_vectors[filtered_indices]
+        name_scores = np.dot(filtered_name_vecs, q_vec.T).squeeze()
+        name_scores = np.atleast_1d(name_scores)
+        
+        # Step D: Combined score
+        best_score = -1.0
+        best_idx = -1
+        for rank, fi in enumerate(filtered_indices):
+            cat_sim = cat_sim_map.get(mock_categories[fi], 0.0)
+            n_sim = float(name_scores[rank])
+            final = ALPHA_CATEGORY * cat_sim + BETA_NAME * max(n_sim, 0.0)
+            if final > best_score:
+                best_score = final
+                best_idx = fi
+        
         t_end = time.perf_counter()
         lat = (t_end - t_start) * 1000
         all_latencies.append(lat)
         
-        top_idx = indices[0][0]
-        top_score = scores[0][0]
-        matched_name = MOCK_PLACES[top_idx]["name"] if top_idx != -1 else "None"
+        matched_name = MOCK_PLACES[best_idx]["name"] if best_idx >= 0 else "None"
+        matched_category = MOCK_PLACES[best_idx]["category"] if best_idx >= 0 else "None"
         
         is_success = matched_name == scene["expected"]
         if is_success:
@@ -527,21 +567,27 @@ if __name__ == "__main__":
         else:
             status_tag = "❌ MISMATCH"
             
-        print(f"Query:  \"{q}\"")
-        print(f"Match:  {matched_name} (Score: {top_score:.4f} | Latency: {lat:.2f}ms) -> {status_tag}")
-        print("-" * 65)
+        # Show matched categories
+        top_cats = sorted(cat_sim_map.items(), key=lambda x: x[1], reverse=True)[:5]
+        cat_display = ", ".join([f"{c}({s:.3f})" for c, s in top_cats])
         
-        # Save verification result for report
+        print(f"Query:    \"{q}\"")
+        print(f"Cat Match: [{cat_display}]")
+        print(f"Result:   {matched_name} [{matched_category}] (Score: {best_score:.4f} | Latency: {lat:.2f}ms) -> {status_tag}")
+        print("-" * 80)
+        
         verification_results.append({
             "query": q,
             "expected": scene["expected"],
             "matched_name": matched_name,
-            "score": float(top_score),
+            "matched_category": matched_category,
+            "score": float(best_score),
+            "matched_categories": [c for c, _ in top_cats],
             "latency": lat,
             "is_success": is_success
         })
         
-    # Latency Stats over repeated inference tests
+    # Latency profiling
     extra_iterations = 30
     print(f"Profiling latency stability across {extra_iterations} iterations...")
     for i in range(extra_iterations):
@@ -549,7 +595,8 @@ if __name__ == "__main__":
         t_s = time.perf_counter()
         with torch.no_grad():
             q_vec = bench_model.encode([q], convert_to_numpy=True, normalize_embeddings=True).astype('float32')
-            _ = bench_index.search(q_vec, 3)
+            cat_scores = np.dot(cat_vectors, q_vec.T).squeeze()
+            name_scores = np.dot(mock_name_vectors, q_vec.T).squeeze()
         all_latencies.append((time.perf_counter() - t_s) * 1000)
         
     mean_lat = np.mean(all_latencies)
@@ -557,7 +604,7 @@ if __name__ == "__main__":
     p99 = np.percentile(all_latencies, 99)
     
     print("\n" + "="*50)
-    print("               BENCHMARK RESULT METRICS")
+    print("          v4 BENCHMARK RESULT METRICS")
     print("="*50)
     print(f"  - Matching Accuracy:  {success_count}/{len(test_scenarios)} ({(success_count/len(test_scenarios)*100):.1f}%)")
     print(f"  - Average Search Lat: {mean_lat:.2f} ms")
@@ -571,23 +618,28 @@ if __name__ == "__main__":
         print("⚠️ STATUS: WARNING - Tail latency exceeds target budget.")
     print("="*80 + "\n")
     
-    # 5. Generate and Save Markdown Report
+    # Generate Markdown Report
     import datetime
     report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmark_report.md")
     
     status_emoji = "🎉 SUCCESS" if p90 < 200 else "⚠️ WARNING"
     status_desc = "Tail latency is well under the 200ms threshold." if p90 < 200 else "Tail latency exceeds target budget."
     
-    report_content = f"""# SpotSync AI Semantic Search Benchmark Report
+    report_content = f"""# SpotSync AI v4 - Decomposed Category Similarity Benchmark Report
 
 Generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 🏗️ Architecture: Decomposed Category Similarity (v4)
+- **Approach**: Query → Category Prototype Matching → PostGIS Category Filter → Name Similarity → Weighted Score
+- **Scoring Formula**: `final = {ALPHA_CATEGORY} × category_sim + {BETA_NAME} × name_sim`
+- **Category Threshold**: `0.45`
 
 ## 🖥️ System & Model Configurations
 - **Model Name**: `{MODEL_NAME}`
 - **Device**: `{DEVICE}`
-- **FAISS Index Type**: `IndexFlatIP` (Cosine Similarity via L2 Normalization)
+- **Category Prototypes**: `{len(CATEGORY_DESCRIPTIONS)}` categories pre-cached
 - **PyTorch Thread Limit**: `{torch.get_num_threads()} threads`
-- **Total Indexed Mock Places**: `{len(MOCK_PLACES)}`
+- **Total Mock Places**: `{len(MOCK_PLACES)}`
 
 ## 📊 Performance Metrics Summary
 - **Overall Status**: **{status_emoji}** ({status_desc})
@@ -597,17 +649,17 @@ Generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 - **Peak Latency (p99)**: `{p99:.2f} ms`
 
 ## 🧪 Detailed Verification Scenarios
-| # | Query | Expected Place | Matched Place | Similarity Score | Latency (ms) | Status |
-|---|---|---|---|---|---|---|
+| # | Query | Expected | Matched | Category | Score | Latency (ms) | Status |
+|---|-------|----------|---------|----------|-------|-------------|--------|
 """
     for idx, res in enumerate(verification_results, 1):
         status_tag = "✅ MATCH" if res['is_success'] else "❌ MISMATCH"
-        report_content += f"| {idx} | {res['query']} | {res['expected']} | {res['matched_name']} | {res['score']:.4f} | {res['latency']:.2f} | {status_tag} |\n"
+        cats = ", ".join(res['matched_categories'][:3])
+        report_content += f"| {idx} | {res['query']} | {res['expected']} | {res['matched_name']} | {cats} | {res['score']:.4f} | {res['latency']:.2f} | {status_tag} |\n"
         
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_content)
-        print(f"[BENCHMARK] Beautiful markdown report successfully saved to:\n  -> {report_path}\n")
+        print(f"[BENCHMARK] Report saved to:\n  -> {report_path}\n")
     except Exception as e:
         print(f"[BENCHMARK ERROR] Failed to save report: {str(e)}")
-
