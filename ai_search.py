@@ -391,11 +391,13 @@ async def semantic_search(request: Request, body: SearchRequest):
         # ==================================================================
         # Step 4: Batch-encode candidate names → compute name similarity
         # ==================================================================
-        candidate_names = [c["name"] for c in candidates]
+        # Encode "name + category" for richer semantic signal
+        # (bare brand names like "싱크사운드" have no semantic meaning on their own)
+        candidate_name_texts = [f"{c['name']} {c['category']}" for c in candidates]
         
         with torch.no_grad():
             name_vectors = model.encode(
-                candidate_names,
+                candidate_name_texts,
                 convert_to_numpy=True,
                 normalize_embeddings=True
             ).astype('float32')  # Shape: (num_candidates, 768)
@@ -492,11 +494,11 @@ if __name__ == "__main__":
     print(f"Category prototype matrix: {cat_vectors.shape}")
     
     # 3. Encode mock place names
-    mock_names = [p["name"] for p in MOCK_PLACES]
+    mock_name_texts = [f"{p['name']} {p['category']}" for p in MOCK_PLACES]
     mock_categories = [p["category"] for p in MOCK_PLACES]
     
     with torch.no_grad():
-        mock_name_vectors = bench_model.encode(mock_names, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+        mock_name_vectors = bench_model.encode(mock_name_texts, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
     
     # 4. Test queries
     test_scenarios = [
