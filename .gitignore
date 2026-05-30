@@ -1,0 +1,7 @@
+.env
+node_modules/
+dist/
+*.log
+*.zip
+*.csv
+__pycache__/

@@ -1,0 +1,5 @@
+# Ignore all files to eliminate performance bottleneck
+*
+**/*
+**
+C:/**

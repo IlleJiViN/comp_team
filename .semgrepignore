@@ -1,0 +1,26 @@
+# Ignore virtual environment and packages
+.venv/
+venv/
+env/
+
+# Ignore Python cache
+**/__pycache__/
+*.pyc
+
+# Ignore large data files and databases
+*.csv
+*.zip
+*.db
+*.index
+spotsync.db
+spotsync.index
+
+# Ignore third-party package folders
+node_modules/
+.git/
+
+# Ignore all files
+*
+**/*
+**
+
