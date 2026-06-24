@@ -1,37 +1,34 @@
 import os
 import time
 import torch
-import psycopg2
+import json
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
 from tqdm import tqdm
 
-# Load environment variables
-load_dotenv()
-
-# Database connection
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/spotsync")
+# Settings
 MODEL_NAME = "jhgan/ko-sroberta-multitask"
 BATCH_SIZE = 256
+INPUT_FILE = "places_data.json"
 OUTPUT_FILE = "rich_place_embeddings.pt"
 
-def fetch_data(conn):
-    print("[1] Fetching all places from database...")
-    cur = conn.cursor()
-    # Fetch id, name, category, address, and description (reviews)
-    cur.execute("SELECT id, name, category, address, description FROM places")
-    rows = cur.fetchall()
+def fetch_data():
+    print(f"[1] Loading data from {INPUT_FILE}...")
+    if not os.path.exists(INPUT_FILE):
+        print(f"Error: {INPUT_FILE} not found. Please ensure it is in the same directory.")
+        return []
+        
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        rows = json.load(f)
     
     places = []
     for r in rows:
-        pid, name, cat, addr, desc = r
-        name = name or ""
-        cat = cat or ""
-        addr = addr or ""
-        desc = desc or ""
+        pid = r['id']
+        name = r['name']
+        cat = r['category']
+        addr = r['address']
+        desc = r['description']
         
-        # Limit description length to avoid exceeding model's max token length (usually 512 tokens)
-        # We take the first 1000 characters of the combined reviews which usually covers the most important points.
+        # Limit description length
         short_desc = desc[:1000]
         
         # Combine into rich text format
@@ -44,16 +41,8 @@ def fetch_data(conn):
 def main():
     print("=== GPU Embedding Worker for SpotSync ===")
     
-    # 1. Connect to DB
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-    except Exception as e:
-        print(f"Error connecting to database: {e}")
-        print("Please check your .env file or DATABASE_URL.")
-        return
-
-    # 2. Fetch data
-    places = fetch_data(conn)
+    # 1. Fetch data
+    places = fetch_data()
     if not places:
         print("No places found. Exiting.")
         return
@@ -91,7 +80,6 @@ def main():
     torch.save({"ids": ids, "vectors": vectors}, OUTPUT_FILE)
     print("    -> Saved successfully. You can now upload this file to the server.")
     
-    conn.close()
     print("\n=== All Done! ===")
 
 if __name__ == "__main__":
