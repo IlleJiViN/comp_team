@@ -59,8 +59,8 @@ async def fetch_naver_blog(session, sem, query):
             try:
                 async with session.get(url, headers=headers, params=params, timeout=5) as res:
                     if res.status == 429:
-                        print(f"Naver Key {nid} TPS rate limited, sleeping 2 seconds...")
-                        await asyncio.sleep(2.0)
+                        print(f"Naver Key {nid} TPS rate limited, sleeping 1.0 seconds...")
+                        await asyncio.sleep(1.0)
                         return "RETRY", []
                     if res.status != 200:
                         return "ERROR", []
@@ -100,8 +100,8 @@ async def fetch_kakao_blog(session, sem, query):
             try:
                 async with session.get(url, headers=headers, params=params, timeout=5) as res:
                     if res.status == 429:
-                        print(f"Kakao Key {kkey} TPS rate limited, sleeping 2 seconds...")
-                        await asyncio.sleep(2.0)
+                        print(f"Kakao Key {kkey} TPS rate limited, sleeping 1.0 seconds...")
+                        await asyncio.sleep(1.0)
                         return "RETRY", []
                     if res.status != 200:
                         return "ERROR", []
@@ -179,10 +179,10 @@ async def main():
                     break
         places_to_scrape.append((pid, name, address, dong))
         
-    sem = asyncio.Semaphore(15) # Safe TPS limit for combined API
+    sem = asyncio.Semaphore(50) # Increased concurrency for faster scraping
     
     async with aiohttp.ClientSession() as session:
-        batch_size = 500
+        batch_size = 1000
         for i in range(0, len(places_to_scrape), batch_size):
             batch = places_to_scrape[i:i+batch_size]
             tasks = [process_place(session, sem, p) for p in batch]

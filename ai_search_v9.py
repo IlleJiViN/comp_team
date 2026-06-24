@@ -37,11 +37,11 @@ app.add_middleware(
 
 from google import genai
 
-# Initialize Google GenAI client for Vertex AI embeddings (using GCP credit)
+# Initialize Google GenAI client for Vertex AI embeddings (using GCP project genspotsync)
 google_client = None
 try:
-    print("[INFO] Initializing Google GenAI Client for Vertex AI (us-central1)...")
-    google_client = genai.Client(vertexai=True, project="spotsync-500217", location="us-central1")
+    print("[INFO] Initializing Google GenAI Client for Vertex AI (genspotsync)...")
+    google_client = genai.Client(vertexai=True, project="genspotsync", location="us-central1")
 except Exception as e:
     print(f"[WARN] Failed to initialize Google GenAI Client: {e}. Standard embedding queries may fail.")
 

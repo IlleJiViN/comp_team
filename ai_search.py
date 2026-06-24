@@ -235,11 +235,15 @@ async def lifespan(app: FastAPI):
             conn.execute(text("SELECT 1"))
         print("[STARTUP] PostgreSQL/PostGIS connection established successfully.")
         
+        # Step 4: Initialize in-memory vector cache
+        place_vectors_map = {}
+        
         # Assign variables to global app state
         app.state.model = model
         app.state.engine = engine
         app.state.category_names = category_names
         app.state.category_vectors = category_vectors
+        app.state.place_vectors_map = place_vectors_map
         
         duration = (time.perf_counter() - start_time) * 1000
         print(f"[STARTUP] v4 Decomposed Category Similarity engine initialized in {duration:.2f}ms.")
@@ -290,6 +294,7 @@ async def semantic_search(request: Request, body: SearchRequest):
     engine = request.app.state.engine
     category_names: List[str] = request.app.state.category_names
     category_vectors: np.ndarray = request.app.state.category_vectors
+    place_vectors_map: dict = getattr(request.app.state, "place_vectors_map", {})
     
     if not model or not engine:
         return JSONResponse(
@@ -384,10 +389,31 @@ async def semantic_search(request: Request, body: SearchRequest):
                 latency_ms=round(latency, 2)
             )
         
-        # On-the-fly encoding for name matching
-        candidate_names = [f"{c['name']} {c['category']}" for c in candidates]
-        with torch.no_grad():
-            name_vectors = model.encode(candidate_names, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+        # Dynamic cached encoding for name matching
+        candidate_vectors = []
+        fallback_names = []
+        fallback_indices = []
+        fallback_pids = []
+        
+        for idx, c in enumerate(candidates):
+            pid = c["id"]
+            if pid in place_vectors_map:
+                candidate_vectors.append(place_vectors_map[pid])
+            else:
+                candidate_vectors.append(None)
+                fallback_names.append(f"{c['name']} {c['category']}")
+                fallback_indices.append(idx)
+                fallback_pids.append(pid)
+                
+        if fallback_names:
+            with torch.no_grad():
+                encoded_fallback = model.encode(fallback_names, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
+            for i, f_idx in enumerate(fallback_indices):
+                vec = encoded_fallback[i]
+                candidate_vectors[f_idx] = vec
+                place_vectors_map[fallback_pids[i]] = vec # Cache for future
+                
+        name_vectors = np.array(candidate_vectors, dtype=np.float32)
         
         # Compute name similarity scores
         name_scores = np.dot(name_vectors, query_vector.T).squeeze()
