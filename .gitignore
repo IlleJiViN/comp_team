@@ -13,4 +13,6 @@ data/
 scratch/
 models/
 .agents/
+*.pt
+*.dump
 

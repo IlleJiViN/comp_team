@@ -134,6 +134,7 @@ function App() {
   const [aiMessage, setAiMessage] = useState("");
   const [customLoc, setCustomLoc] = useState("");
   const [roomId, setRoomId] = useState(null);
+  const [searchMode, setSearchMode] = useState('local');
   const [currentUser, setCurrentUser] = useState(() => {
     const saved = localStorage.getItem('currentUser');
     return saved ? JSON.parse(saved) : null;
@@ -388,7 +389,8 @@ function App() {
     setResults([]);
     
     try {
-      const res = await fetch('http://localhost:8001/search_rag', {
+      const endpoint = searchMode === 'local' ? 'http://localhost:8000/search_rag' : 'http://localhost:8001/search_rag';
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 
           'Content-Type': 'application/json'
@@ -692,6 +694,16 @@ function App() {
       </div>
 
       <form className="toss-card" onSubmit={handleSearch}>
+        <div style={{ marginBottom: '1rem', display: 'flex', gap: '1.5rem', justifyContent: 'center' }}>
+          <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.9rem', color: 'var(--text-color)' }}>
+            <input type="radio" name="searchMode" value="local" checked={searchMode === 'local'} onChange={() => setSearchMode('local')} />
+            <strong>로컬 AI 검색</strong> (BGE-M3 1024차원 + Elasticsearch)
+          </label>
+          <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.9rem', color: 'var(--text-color)' }}>
+            <input type="radio" name="searchMode" value="vertex" checked={searchMode === 'vertex'} onChange={() => setSearchMode('vertex')} />
+            <strong>구글 자체 RAG</strong> (Vertex AI Search)
+          </label>
+        </div>
         <div className="search-input-wrapper">
           <input
             type="text"

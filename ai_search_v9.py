@@ -15,8 +15,7 @@ import requests
 import secrets
 from dotenv import load_dotenv
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
+# Gemini API 제거됨 - 유료 API 호출 없음
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -35,43 +34,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from google import genai
-
-# Initialize Google GenAI client for Vertex AI embeddings (using GCP project genspotsync)
-google_client = None
-try:
-    print("[INFO] Initializing Google GenAI Client for Vertex AI (genspotsync)...")
-    google_client = genai.Client(vertexai=True, project="genspotsync", location="us-central1")
-except Exception as e:
-    print(f"[WARN] Failed to initialize Google GenAI Client: {e}. Standard embedding queries may fail.")
-
-model = None
+print("[INFO] Loading BGE-M3 model for embeddings...")
+embed_model = SentenceTransformer('BAAI/bge-m3', device='cpu')
 
 def get_embedding(text: str):
-    global google_client
-    import random
-    import time
-    
-    if not google_client:
-        raise RuntimeError("Google GenAI Client is not initialized.")
-        
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            res = google_client.models.embed_content(
-                model="text-embedding-004",
-                contents=text
-            )
-            if res and res.embeddings:
-                return np.array(res.embeddings[0].values, dtype=np.float32)
-        except Exception as e:
-            wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
-            print(f"[WARN] Vertex AI embedding failed: {e}. Retrying in {wait_time:.2f}s... (Attempt {attempt+1}/{max_attempts})")
-            if attempt < max_attempts - 1:
-                time.sleep(wait_time)
-            else:
-                print(f"[ERROR] Vertex AI embedding failed after {max_attempts} attempts.")
-                raise RuntimeError(f"Vertex AI embedding failed after 3 attempts: {e}")
+    return embed_model.encode(text, normalize_embeddings=True)
 
 
 print("[INFO] Loading SpotSync NER model...")
@@ -82,11 +49,7 @@ with open(os.path.join(ner_model_path, "label_config.json"), "r", encoding="utf-
     label_config = json.load(f)
 label_list = label_config["label_list"]
 
-print("[INFO] Loading Gemini LLM via LangChain (with fallbacks)...")
-llm_primary = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY, streaming=True)
-llm_fallback1 = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=GOOGLE_API_KEY, streaming=True)
-llm_fallback2 = ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GOOGLE_API_KEY, streaming=True)
-llm = llm_primary.with_fallbacks([llm_fallback1, llm_fallback2])
+# LLM 없음 - 로컬 요약만 사용
 
 from elasticsearch import Elasticsearch
 
@@ -405,9 +368,32 @@ async def search_rag(req: SearchQuery):
     print(f"[NER] Query: '{req.query}' -> Extracted: {entities}")
     
     query_emb = get_embedding(req.query)
-    
     # Filter by Category
     es_filters = extract_filters(entities)
+
+    # 1. PostGIS Geo-Filtering (Radius search) before ES retrieval
+    midpoint = calculate_midpoint(req.user_locations)
+    nearby_place_ids = []
+    if midpoint:
+        mid_lat, mid_lng = midpoint
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Dynamic radius expansion: 7km -> 15km -> 50km
+        for radius in [7000, 15000, 50000]:
+            cur.execute("""
+                SELECT id FROM places 
+                WHERE ST_DWithin(location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+            """, (mid_lng, mid_lat, radius))
+            nearby_place_ids = [row[0] for row in cur.fetchall()]
+            if len(nearby_place_ids) >= 10:
+                print(f"[GEO-FILTER] Found {len(nearby_place_ids)} places within {radius}m of midpoint")
+                break
+        conn.close()
+        
+        if nearby_place_ids:
+            es_filters.append({"terms": {"place_id": nearby_place_ids}})
+        else:
+            print("[GEO-FILTER] No places found within 50km of midpoint. Skipping location filter.")
     
     # 1. Elasticsearch Hybrid Query (KNN + BM25)
     should_clauses = [
@@ -636,6 +622,19 @@ async def search_rag(req: SearchQuery):
                 es.indices.refresh(index="spotsync_chunks")
                 conn.close()
                 
+                # Fallback: Update nearby_place_ids and ES filter body to include newly created place IDs
+                if new_place_ids:
+                    new_pids = [item[0] for item in new_place_ids]
+                    for pid in new_pids:
+                        if pid not in nearby_place_ids:
+                            nearby_place_ids.append(pid)
+                    if es_filters:
+                        for f in es_filters:
+                            if "terms" in f and "place_id" in f["terms"]:
+                                f["terms"]["place_id"] = nearby_place_ids
+                        body["knn"]["filter"] = es_filters
+                        body["query"]["bool"]["filter"] = es_filters
+                
                 print("[FALLBACK] Indexing complete! Re-running ES query...")
                 res = es.options(request_timeout=15).search(index="spotsync_chunks", body=body)
                 hits = res['hits']['hits']
@@ -773,46 +772,9 @@ async def search_rag(req: SearchQuery):
             context_texts.append(f"DB ID: {db_id} | [{name}] 카테고리: {category}\n설명/리뷰: {str(desc)[:400]}")
             
     conn.close()
-    context_str = "\n\n".join(context_texts)
-    
-    template = """당신은 위치 기반 장소 추천 서비스 'SpotSync'의 AI 가이드입니다.
-아래 검색된 장소 정보와 리뷰를 바탕으로, 추천된 장소들이 왜 유저의 질문에 적합한지 각각 1~2줄로 간결하고 전문적인 IT 서비스(예: 토스, 네이버) 말투로 설명해주세요.
-과도한 이모지와 감탄사(💖, 🥰 등)는 절대 사용하지 마세요. 차분하고 신뢰감 있는 톤을 유지하세요.
-
-반드시 아래와 같은 양식으로 각 장소의 DB ID를 대괄호로 감싼 후 설명을 작성해야 합니다. (다른 인사말이나 맺음말은 일절 출력하지 마세요)
-
-[ID: 12345]
-노트북 작업에 최적화된 넓은 데스크와 전 좌석 콘센트가 완비되어 있습니다.
-
-[ID: 67890]
-조용한 분위기와 깔끔한 인테리어로 집중하기 좋은 공간입니다.
-
-[검색된 장소 정보]
-{context}
-
-유저 질문: {query}
-"""
-    prompt = PromptTemplate(template=template, input_variables=["context", "query"])
-    chain = prompt | llm
-    
     async def event_generator():
         elapsed = time.time() - t_start
         yield f"data: {json.dumps({'type': 'results', 'results': results, 'elapsed_sec': round(elapsed, 2)})}\n\n"
-        
-        try:
-            async for chunk in chain.astream({"context": context_str, "query": req.query}):
-                if chunk.content:
-                    text_chunk = chunk.content
-                    if isinstance(text_chunk, list):
-                        text_chunk = "".join([part.get("text", "") for part in text_chunk if isinstance(part, dict)])
-                    elif not isinstance(text_chunk, str):
-                        text_chunk = str(text_chunk)
-                        
-                    yield f"data: {json.dumps({'type': 'chunk', 'text': text_chunk})}\n\n"
-        except Exception as e:
-            print(f"LLM Generation Error: {e}", flush=True)
-            yield f"data: {json.dumps({'type': 'chunk', 'text': f'\\n\\n[AI 추천 요약을 불러오지 못했습니다: {str(e)[:50]}...]'})}\n\n"
-            
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
