@@ -1,0 +1,1 @@
+import sys; sys.stdout.reconfigure(encoding='utf-8'); from elasticsearch import Elasticsearch; es = Elasticsearch('http://localhost:9200'); res = es.search(index='spotsync_chunks', body={'query': {'match_all': {}}}, size=100); print([(h['_source']['name'], h['_source']['region']) for h in res['hits']['hits'] if '±¹¹ä' in h['_source']['name']])

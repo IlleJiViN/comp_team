@@ -74,7 +74,7 @@ def search_destinations(keyword, origin_data, similarity_threshold=0.15, kakao_a
             "similarity_threshold": similarity_threshold,
             "top_k": 15
         }
-        resp = requests.post(api_url, json=payload, timeout=5)
+        resp = requests.post(api_url, json=payload, timeout=30)
         if resp.status_code == 200:
             data = resp.json()
             results = data.get("results", [])
@@ -88,7 +88,7 @@ def search_destinations(keyword, origin_data, similarity_threshold=0.15, kakao_a
                 st.session_state.search_status = f"🤖 SpotSync AI Local Semantic Search Server (Found {len(dest_data)} matches)"
                 return dest_data
             else:
-                st.session_state.search_status = "🤖 SpotSync AI Server is ONLINE, but returned 0 results within 15km (Database contains Gyeonggi-do only)."
+                st.session_state.search_status = "🤖 SpotSync AI Server is ONLINE, but returned 0 results within 15km."
     except Exception as e:
         import traceback; traceback.print_exc()
         
@@ -235,7 +235,7 @@ def search_destinations(keyword, origin_data, similarity_threshold=0.15, kakao_a
         
     if dest_data and (not st.session_state.get("search_status") or "Unknown" in st.session_state.search_status or "ONLINE" in st.session_state.search_status):
         if "ONLINE" in st.session_state.get("search_status", ""):
-            st.session_state.search_status = f"🤖 SpotSync AI Online (0 Gyeonggi-do DB results) ➔ Fallback: 🌍 OpenStreetMap (Found {len(dest_data)} matches)"
+            st.session_state.search_status = f"🤖 SpotSync AI Online (0 DB results) ➔ Fallback: 🌍 OpenStreetMap (Found {len(dest_data)} matches)"
         else:
             st.session_state.search_status = f"🌍 OpenStreetMap (Overpass) (Found {len(dest_data)} matches)"
         
@@ -268,7 +268,7 @@ def search_destinations(keyword, origin_data, similarity_threshold=0.15, kakao_a
             
     if dest_data and (not st.session_state.get("search_status") or "Unknown" in st.session_state.search_status or "ONLINE" in st.session_state.search_status or "OSM" in st.session_state.search_status):
         if "ONLINE" in st.session_state.get("search_status", ""):
-            st.session_state.search_status = f"🤖 SpotSync AI Online (0 Gyeonggi-do DB results) ➔ Fallback: 🗺️ OSM Address Geocoder (Found {len(dest_data)} matches)"
+            st.session_state.search_status = f"🤖 SpotSync AI Online (0 DB results) ➔ Fallback: 🗺️ OSM Address Geocoder (Found {len(dest_data)} matches)"
         else:
             st.session_state.search_status = f"🗺️ OSM Address Geocoder Fallback (Found {len(dest_data)} matches)"
             
@@ -378,8 +378,8 @@ if not st.session_state.search_active or not st.session_state.results:
 if "search_status" in st.session_state:
     status_str = st.session_state.search_status
     if "🤖" in status_str:
-        if "0 Gyeonggi-do DB results" in status_str:
-            st.info(f"💡 **안내**: {status_str} (경기도 행정구역 범위 밖의 출발지로 인해 일반 주소 검색으로 우회 매칭되었습니다. 정밀 시맨틱 검색을 원하시면 경기도 범위의 출발지 주소를 입력해 주세요!)")
+        if "0 DB results" in status_str:
+            st.info(f"💡 **안내**: {status_str} (AI DB에서 반경 내 결과를 찾지 못해 일반 주소 검색으로 우회 매칭되었습니다. 아직 벡터 변환이 완료되지 않은 지역일 수 있습니다.)")
         else:
             st.success(f"🔍 **검색 성공**: {status_str}")
     elif "⚡" in status_str:

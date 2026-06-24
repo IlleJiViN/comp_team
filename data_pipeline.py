@@ -56,24 +56,30 @@ def extract_and_load_csv():
         print(f"[PIPELINE] Extracted ZIP in {time.perf_counter() - t0:.2f} seconds.")
         csv_files = glob.glob("*.csv")
         
-    # Target only the Gyeonggi-do CSV file specifically
-    gyeonggi_files = [f for f in csv_files if "경기" in f]
-    if gyeonggi_files:
-        csv_file_path = gyeonggi_files[0]
-    else:
-        csv_file_path = csv_files[0]
-    print(f"[PIPELINE] Found target CSV file to parse: {csv_file_path}")
+    # Target all nationwide CSV files
+    target_files = csv_files
+    
+    if not target_files:
+        raise FileNotFoundError("Could not find any CSV files even after extraction.")
+        
+    print(f"[PIPELINE] Found target CSV files to parse: {target_files}")
     
     # Load using UTF-8 with robust replacement of corrupted bytes to ensure perfect Korean loading
-    print(f"[PIPELINE] Loading CSV with UTF-8 encoding (resilient bad byte replacement)...")
+    print(f"[PIPELINE] Loading CSVs with UTF-8 encoding (resilient bad byte replacement)...")
     t0 = time.perf_counter()
-    df = pd.read_csv(
-        csv_file_path, 
-        sep=',', 
-        encoding='utf-8', 
-        encoding_errors='replace', 
-        dtype=str
-    )
+    dfs = []
+    for csv_file_path in target_files:
+        print(f"  - Loading {csv_file_path}...")
+        df_part = pd.read_csv(
+            csv_file_path, 
+            sep=',', 
+            encoding='utf-8', 
+            encoding_errors='replace', 
+            dtype=str
+        )
+        dfs.append(df_part)
+    
+    df = pd.concat(dfs, ignore_index=True)
     print(f"[PIPELINE] Loaded successfully in {time.perf_counter() - t0:.2f}s. Row count: {len(df)}")
     return df
 
@@ -111,13 +117,8 @@ def clean_and_transform(df: pd.DataFrame):
           f"  - Address: {address_col}\n"
           f"  - Lon/Lat: {lon_col}/{lat_col}")
           
-    # 3. Filter only Gyeonggi-do places (as requested to avoid massive nationwide processing)
-    sido_col = [col for col in df.columns if "시도명" in col]
-    if sido_col:
-        df = df[df[sido_col[0]].astype(str).str.contains("경기", na=False)]
-    else:
-        df = df[df[address_col].astype(str).str.contains("경기도|경기 ", na=False)]
-    print(f"[PIPELINE] Filtered Gyeonggi-do places. Count: {len(df)}")
+    # No region filtering - loading nationwide data.
+    print(f"[PIPELINE] Initial Row Count: {len(df)}")
     
     # Prevent empty records on coordinates
     df = df.dropna(subset=[lat_col, lon_col])
@@ -143,111 +144,13 @@ def clean_and_transform(df: pd.DataFrame):
     mid_cat_series = df[mid_cat_cols[0]].fillna("") if mid_cat_cols else pd.Series("", index=df.index)
     bldg_series = df[bldg_cols[0]].fillna("") if bldg_cols else pd.Series("", index=df.index)
     
-    def enrich_row_v1(row):
-        addr = str(row[address_col])
-        name = str(row[name_col])
-        cat = str(row[category_col])
-        branch = str(row["_branch"])
-        major = str(row["_major"])
-        mid = str(row["_mid"])
-        bldg = str(row["_bldg"])
-        
-        full_name = f"{name} {branch}".strip()
-        
-        desc = f"이 장소는 {addr}"
-        if bldg:
-            desc += f" ({bldg})"
-        desc += f"에 위치한 '{full_name}'이며, 업종은 {cat}입니다."
-        
-        cat_hierarchy = []
-        if major:
-            cat_hierarchy.append(major)
-        if mid:
-            cat_hierarchy.append(mid)
-        if cat and cat not in cat_hierarchy:
-            cat_hierarchy.append(cat)
-            
-        desc += " 관련 분류로는 " + ", ".join(cat_hierarchy) + " 등이 있습니다."
-        
-        lower_name = name.lower()
-        lower_cat = cat.lower()
-        lower_mid = mid.lower()
-        
-        enrichments = []
-        
-        # Cafe, coffee, dessert, bakery
-        if any(k in lower_cat or k in lower_mid or k in lower_name for k in ["카페", "커피", "디저트", "베이커리", "제과", "다방", "cafe", "coffee", "바리스타", "찻집"]):
-            enrichments.append("노트북 들고 공부하기 편한 조용하고 편안한 카페, 아늑하고 콘센트가 많은 작업 공간, 분위기 좋은 디저트와 맛있는 커피가 있는 베이커리 맛집 공간입니다.")
-        # PC Room, gaming
-        elif any(k in lower_cat or k in lower_mid or k in lower_name for k in ["pc방", "피씨방", "pc", "게임", "gaming"]):
-            enrichments.append("컴퓨터 그래픽카드 최고 사양 게이밍 모니터 넓은 피씨방, 초고속 인터넷, FPS 게임과 다양한 온라인 게임을 즐기기 좋은 프리미엄 게이밍 공간입니다.")
-        # Rehearsal room
-        elif any(k in lower_cat or k in lower_mid or k in lower_name for k in ["합주실", "연습실", "음악실", "스튜디오", "녹음", "studio", "밴드", "드럼", "마이크", "방음", "음악", "보컬", "악기", "기타", "피아노"]):
-            enrichments.append("드럼이랑 마이크 성능 좋은 방음 잘되는 음악 합주실, 보컬 밴드 노래 연습 개인 녹음 스튜디오, 최상의 방음 시설과 전문가용 마이크 및 악기가 완비된 연습실 공간입니다.")
-        # Coin karaoke
-        elif any(k in lower_cat or k in lower_mid or k in lower_name for k in ["노래방", "코인", "노래연습장", "노래", "코노"]):
-            enrichments.append("혼자 가서 보컬 연습하고 마이크 녹음하기 조용한 스튜디오, 음질 좋은 최신 반주기와 무선 마이크, 화려한 LED 조명을 갖춘 코인 노래연습장입니다.")
-        # Restaurant
-        elif any(k in lower_cat or k in lower_mid or k in lower_name for k in ["식당", "음식점", "밥집", "맛집", "한식", "중식", "일식", "양식", "분식", "고기", "구이", "치킨", "피자", "파스타", "국밥"]):
-            enrichments.append("맛있고 위생적이며 친절한 식당, 다양한 메뉴를 제공하여 가족 외식, 친구들과의 모임 및 데이트 코스로 추천하는 맛집 공간입니다.")
-        # Pub
-        elif any(k in lower_cat or k in lower_mid or k in lower_name for k in ["술집", "호프", "맥주", "포차", "이자카야", "바(bar)", "펍", "bar", "pub"]):
-            enrichments.append("안주가 맛있고 분위기 좋은 감성 술집, 시원한 맥주나 하이볼, 칵테일 한잔하며 이야기 나누기 좋은 모임 공간입니다.")
-            
-        if enrichments:
-            desc += " " + " ".join(enrichments)
-            
-        return desc
-
-    def enrich_row_v2(row):
-        name = str(row[name_col])
-        cat = str(row[category_col])
-        branch = str(row["_branch"])
-        major = str(row["_major"])
-        mid = str(row["_mid"])
-        
-        full_name = f"{name} {branch}".strip()
-        
-        cat_hierarchy = []
-        if major:
-            cat_hierarchy.append(major)
-        if mid:
-            cat_hierarchy.append(mid)
-            
-        hierarchy_str = " > ".join(cat_hierarchy)
-        
-        if hierarchy_str:
-            desc = f"{full_name}은 {cat} ({hierarchy_str})"
-        else:
-            desc = f"{full_name}은 {cat}"
-        return desc
+    # V4 uses raw name and category on-the-fly, so no need to build embedding_text columns here.
+    # We create empty placeholder columns just to avoid changing the DB load schema.
+    df["embedding_text"] = ""
+    df["embedding_text_v2"] = ""
+    df["embedding_text_v3"] = ""
     
-    def enrich_row_v3(row):
-        name = str(row[name_col])
-        cat = str(row[category_col])
-        branch = str(row["_branch"])
-        major = str(row["_major"])
-        mid = str(row["_mid"])
-        
-        full_name = f"{name} {branch}".strip()
-        
-        desc = CATEGORY_DESCRIPTIONS.get(cat)
-        if desc:
-            return f"{full_name}은 {cat} ({major} > {mid}) 업종에 속하며, {desc}"
-        else:
-            desc_fallback = f"전문성과 오랜 경험을 바탕으로 친절하고 체계적인 서비스를 제공하여 방문하시는 모든 고객에게 깊은 만족을 선사하는 신뢰도 높고 깔끔한 {major} {mid} {cat} 관련 비즈니스 전문 공간입니다."
-            return f"{full_name}은 {cat} ({major} > {mid}) 업종에 속하며, {desc_fallback}"
-
-    df["_branch"] = branch_series
-    df["_major"] = major_cat_series
-    df["_mid"] = mid_cat_series
-    df["_bldg"] = bldg_series
-    
-    df["embedding_text"] = df.apply(enrich_row_v1, axis=1)
-    df["embedding_text_v2"] = df.apply(enrich_row_v2, axis=1)
-    df["embedding_text_v3"] = df.apply(enrich_row_v3, axis=1)
-    
-    df = df.drop(columns=["_branch", "_major", "_mid", "_bldg"])
+    df = df.drop(columns=["_branch", "_major", "_mid", "_bldg"], errors='ignore')
     
     # Convert lat/lon to float
     df[lat_col] = df[lat_col].astype(float)

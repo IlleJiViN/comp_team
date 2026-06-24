@@ -5,3 +5,12 @@ dist/
 *.zip
 *.csv
 __pycache__/
+data/
+*.npz
+*.parquet
+*.jsonl
+.venv/
+scratch/
+models/
+.agents/
+

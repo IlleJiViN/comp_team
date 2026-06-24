@@ -75,11 +75,11 @@ torch.set_num_interop_threads(1)
 MODEL_NAME = "jhgan/ko-sroberta-multitask"
 DEVICE = "cpu"
 DIMENSION = 768
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/spotsync"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/spotsync")
 
 # Scoring weights
-ALPHA_CATEGORY = 0.6   # Weight for category similarity
-BETA_NAME = 0.4        # Weight for name similarity
+ALPHA_CATEGORY = 0.7   # Weight for category similarity
+BETA_NAME = 0.3        # Weight for name similarity
 
 # ==============================================================================
 # [MOCK DATASET]
@@ -329,30 +329,26 @@ async def semantic_search(request: Request, body: SearchRequest):
         # Sort matched categories by score for logging
         matched_categories.sort(key=lambda c: category_sim_map[c], reverse=True)
         
-        # If no categories match, return empty (query is too vague or unrelated)
-        if not matched_categories:
-            latency = (time.perf_counter() - start_time) * 1000
-            return SearchResponse(
-                query=body.query,
-                matched_categories=[],
-                results=[],
-                latency_ms=round(latency, 2)
-            )
+        # Removed early return so we do a fallback broad search
         
         # ==================================================================
         # Step 3: PostGIS spatial + category-filtered query
         # ==================================================================
         degrees = (body.radius_meters / 111000.0) * 1.1
         
-        # Build category IN clause with parameterized values
-        cat_placeholders = ", ".join([f":cat_{i}" for i in range(len(matched_categories))])
         sql_params = {
             "lon": body.user_longitude,
             "lat": body.user_latitude,
             "degrees": degrees
         }
-        for i, cat in enumerate(matched_categories):
-            sql_params[f"cat_{i}"] = cat
+        
+        if matched_categories:
+            cat_placeholders = ", ".join([f":cat_{i}" for i in range(len(matched_categories))])
+            for i, cat in enumerate(matched_categories):
+                sql_params[f"cat_{i}"] = cat
+            cat_condition = f"AND category IN ({cat_placeholders})"
+        else:
+            cat_condition = ""
         
         sql_query = text(f"""
             SELECT id, name, category, latitude, longitude, address,
@@ -360,9 +356,9 @@ async def semantic_search(request: Request, body: SearchRequest):
             FROM places
             WHERE location && ST_Expand(ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)
               AND ST_DWithin(location, ST_SetSRID(ST_Point(:lon, :lat), 4326), :degrees)
-              AND category IN ({cat_placeholders})
+              {cat_condition}
             ORDER BY distance_meters ASC
-            LIMIT 200
+            LIMIT 100
         """)
         
         candidates = []
@@ -388,19 +384,10 @@ async def semantic_search(request: Request, body: SearchRequest):
                 latency_ms=round(latency, 2)
             )
         
-        # ==================================================================
-        # Step 4: Batch-encode candidate names → compute name similarity
-        # ==================================================================
-        # Encode "name + category" for richer semantic signal
-        # (bare brand names like "싱크사운드" have no semantic meaning on their own)
-        candidate_name_texts = [f"{c['name']} {c['category']}" for c in candidates]
-        
+        # On-the-fly encoding for name matching
+        candidate_names = [f"{c['name']} {c['category']}" for c in candidates]
         with torch.no_grad():
-            name_vectors = model.encode(
-                candidate_name_texts,
-                convert_to_numpy=True,
-                normalize_embeddings=True
-            ).astype('float32')  # Shape: (num_candidates, 768)
+            name_vectors = model.encode(candidate_names, convert_to_numpy=True, normalize_embeddings=True).astype('float32')
         
         # Compute name similarity scores
         name_scores = np.dot(name_vectors, query_vector.T).squeeze()

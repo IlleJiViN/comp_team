@@ -14,5 +14,18 @@ services:
       - postgis_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  api:
+    build: .
+    container_name: spotsync-api
+    ports:
+      - "8000:8000"
+    environment:
+      # api 컨테이너 내부에서 DB에 접근할 때는 localhost 대신 db 컨테이너 이름(postgis)을 사용해야 합니다.
+      # ai_search.py 내의 DATABASE_URL을 환경변수로 받을 수 있도록 수정이 필요합니다.
+      - DATABASE_URL=postgresql://postgres:postgres@postgis:5432/spotsync
+    depends_on:
+      - postgis
+    restart: unless-stopped
+
 volumes:
   postgis_data:
