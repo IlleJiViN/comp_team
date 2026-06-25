@@ -33,6 +33,35 @@ const PRESET_LOCATIONS = [
   { name: '홍대입구역 (친구B)', latitude: 37.5568, longitude: 126.9242 },
 ];
 
+const API_VERSIONS = [
+  {
+    id: 'v9',
+    name: 'V9 Unified',
+    description: 'Login, rooms, local RAG',
+    baseUrl: import.meta.env.VITE_SPOTSYNC_V9_API_URL || 'http://localhost:8001',
+    supportsAuth: true,
+    supportsRooms: true,
+  },
+  {
+    id: 'legacy',
+    name: 'Legacy Local',
+    description: 'Local search only',
+    baseUrl: import.meta.env.VITE_SPOTSYNC_LEGACY_API_URL || 'http://localhost:8000',
+    supportsAuth: false,
+    supportsRooms: false,
+  },
+  {
+    id: 'vertex',
+    name: 'Vertex RAG',
+    description: 'Google Vertex AI Search',
+    baseUrl: import.meta.env.VITE_SPOTSYNC_VERTEX_API_URL || 'http://localhost:8001',
+    supportsAuth: false,
+    supportsRooms: false,
+  },
+];
+
+const getApiVersion = (id) => API_VERSIONS.find((version) => version.id === id) || API_VERSIONS[0];
+
 function MapBoundsUpdater({ users, results }) {
   const map = useMap();
   useEffect(() => {
@@ -122,7 +151,7 @@ const Avatar = ({ src, name, size = 24 }) => {
 };
 
 function App() {
-  const [theme, setTheme] = useState('light');
+  const [theme, setTheme] = useState('dark');
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -134,11 +163,14 @@ function App() {
   const [aiMessage, setAiMessage] = useState("");
   const [customLoc, setCustomLoc] = useState("");
   const [roomId, setRoomId] = useState(null);
+  const [apiVersionId, setApiVersionId] = useState(() => localStorage.getItem('spotsyncApiVersion') || 'v9');
   const [searchMode, setSearchMode] = useState('local');
   const [currentUser, setCurrentUser] = useState(() => {
     const saved = localStorage.getItem('currentUser');
     return saved ? JSON.parse(saved) : null;
   });
+  const selectedApi = getApiVersion(apiVersionId);
+  const apiUrl = (path) => `${selectedApi.baseUrl}${path}`;
 
   // Save/Remove user session in localStorage
   useEffect(() => {
@@ -149,6 +181,13 @@ function App() {
     }
   }, [currentUser]);
 
+  useEffect(() => {
+    localStorage.setItem('spotsyncApiVersion', selectedApi.id);
+    if (!selectedApi.supportsRooms) {
+      setRoomId(null);
+    }
+  }, [selectedApi.id, selectedApi.supportsRooms]);
+
   // Handle URL callback for Social Login
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
@@ -157,7 +196,7 @@ function App() {
 
     if (code) {
       const isKakao = state === 'kakao';
-      const endpoint = isKakao ? 'http://localhost:8001/auth/kakao/token' : 'http://localhost:8001/auth/naver/token';
+      const endpoint = isKakao ? apiUrl('/auth/kakao/token') : apiUrl('/auth/naver/token');
       
       fetch(endpoint, {
         method: 'POST',
@@ -195,7 +234,7 @@ function App() {
 
   // Sync / Join Room when currentUser or roomId changes
   useEffect(() => {
-    if (!roomId) return;
+    if (!roomId || !selectedApi.supportsRooms) return;
     
     // Sync Room Query string to URL
     const urlParams = new URLSearchParams(window.location.search);
@@ -211,7 +250,7 @@ function App() {
       const userLoc = users.find(u => u.name === currentUser.name) || PRESET_LOCATIONS[0];
       
       try {
-        await fetch('http://localhost:8001/room/join', {
+        await fetch(apiUrl('/room/join'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -231,7 +270,7 @@ function App() {
     // Poll room members list
     const pollMembers = async () => {
       try {
-        const res = await fetch(`http://localhost:8001/room/${roomId}/members`);
+        const res = await fetch(apiUrl(`/room/${roomId}/members`));
         const data = await res.json();
         if (data.members) {
           const memberLocs = data.members.map(m => ({
@@ -253,13 +292,13 @@ function App() {
     pollMembers();
     const interval = setInterval(pollMembers, 3000);
     return () => clearInterval(interval);
-  }, [roomId, currentUser]);
+  }, [roomId, currentUser, selectedApi.supportsRooms, selectedApi.baseUrl]);
 
   // Update backend location when our user's location changes in a room
   const updateRoomLocation = async (lat, lng) => {
-    if (!roomId || !currentUser) return;
+    if (!roomId || !currentUser || !selectedApi.supportsRooms) return;
     try {
-      await fetch('http://localhost:8001/room/update_location', {
+      await fetch(apiUrl('/room/update_location'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -291,6 +330,10 @@ function App() {
   };
 
   const handleNaverLogin = async () => {
+    if (!selectedApi.supportsAuth) {
+      alert('This runtime does not support social login. Select V9 Unified first.');
+      return;
+    }
     const urlParams = new URLSearchParams(window.location.search);
     const roomParam = urlParams.get('room');
     if (roomParam) {
@@ -298,7 +341,7 @@ function App() {
     }
     
     try {
-      const res = await fetch('http://localhost:8001/auth/naver/login');
+      const res = await fetch(apiUrl('/auth/naver/login'));
       if (!res.ok) {
         throw new Error(`Server returned status ${res.status}`);
       }
@@ -315,6 +358,10 @@ function App() {
   };
 
   const handleKakaoLogin = async () => {
+    if (!selectedApi.supportsAuth) {
+      alert('This runtime does not support social login. Select V9 Unified first.');
+      return;
+    }
     const urlParams = new URLSearchParams(window.location.search);
     const roomParam = urlParams.get('room');
     if (roomParam) {
@@ -322,7 +369,7 @@ function App() {
     }
 
     try {
-      const res = await fetch('http://localhost:8001/auth/kakao/login');
+      const res = await fetch(apiUrl('/auth/kakao/login'));
       if (!res.ok) {
         throw new Error(`Server returned status ${res.status}`);
       }
@@ -389,7 +436,7 @@ function App() {
     setResults([]);
     
     try {
-      const endpoint = searchMode === 'local' ? 'http://localhost:8000/search_rag' : 'http://localhost:8001/search_rag';
+      const endpoint = apiUrl('/search_rag');
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 
@@ -561,7 +608,7 @@ function App() {
               // Create room
               const userLoc = users.find(u => u.name === currentUser.name) || PRESET_LOCATIONS[0];
               try {
-                const res = await fetch('http://localhost:8001/room/create', {
+                const res = await fetch(apiUrl('/room/create'), {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
@@ -694,7 +741,34 @@ function App() {
       </div>
 
       <form className="toss-card" onSubmit={handleSearch}>
-        <div style={{ marginBottom: '1rem', display: 'flex', gap: '1.5rem', justifyContent: 'center' }}>
+        <div className="api-version-panel">
+          <div className="api-version-header">
+            <div>
+              <span className="eyebrow">Backend Model Environment</span>
+              <h2>Select Active Model</h2>
+            </div>
+            <span className="api-base-url">{selectedApi.baseUrl}</span>
+          </div>
+          <div className="api-version-grid" role="radiogroup" aria-label="Search version">
+            {API_VERSIONS.map((version) => (
+              <button
+                key={version.id}
+                type="button"
+                className={`api-version-option ${selectedApi.id === version.id ? 'active' : ''}`}
+                onClick={() => setApiVersionId(version.id)}
+                role="radio"
+                aria-checked={selectedApi.id === version.id}
+              >
+                <span className="api-version-name">{version.name}</span>
+                <span className="api-version-description">{version.description}</span>
+                <span className="api-version-meta">
+                  {version.supportsRooms ? 'Rooms + auth' : 'Search only'}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'none' }}>
           <label style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.9rem', color: 'var(--text-color)' }}>
             <input type="radio" name="searchMode" value="local" checked={searchMode === 'local'} onChange={() => setSearchMode('local')} />
             <strong>로컬 AI 검색</strong> (BGE-M3 1024차원 + Elasticsearch)
