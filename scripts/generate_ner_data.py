@@ -47,8 +47,28 @@ LOCATION_ALIASES = {
     "동대문": ["신설동", "이문동"],
     "신림": ["신림동"],
     "사당": ["사당동"],
+    "건대": ["화양동", "자양동"],
+    "성수": ["성수동1가", "성수동2가", "성수동"],
+    "샤로수길": ["봉천동", "낙성대동"],
+    "가로수길": ["신사동", "압구정동"]
 }
 all_aliases = list(LOCATION_ALIASES.keys())
+
+SLANG_CATEGORIES = {
+    "PC방": ["피방", "피시방", "피씨방", "피시빵", "겜방", "피카", "피씨"],
+    "양식": ["스파게티집", "파스타집", "피자집", "레스토랑", "양식당"],
+    "카페": ["커피숍", "갬성카페", "디저트카페", "카공카페", "커피집", "디저트가게", "베이커리", "빵집"],
+    "한식": ["밥집", "백반집", "한식당", "국밥집", "해장국집", "김천", "분식집"],
+    "일식": ["초밥집", "스시집", "돈까스집", "일식당", "이자카야", "텐동집", "라멘집"],
+    "중식": ["중국집", "짜장면집", "짬뽕집", "마라탕집", "마라샹궈집", "양꼬치집"],
+    "치킨": ["치킨집", "닭집", "통닭집", "치맥", "닭강정집"],
+    "주점": ["술집", "호프집", "포차", "포장마차", "바", "칵테일바", "라운지", "감주", "헌팅포차", "헌포", "루프탑"],
+    "고기/구이": ["고기집", "고깃집", "삼겹살집", "돼지고기집", "소고기집", "한우집", "갈비집", "막창집", "곱창집", "특수부위집"],
+    "횟집": ["회센터", "초장집", "해산물집", "스시야"],
+    "미용실": ["헤어샵", "바버샵", "머리방", "미장원"],
+    "당구장": ["당구장", "포켓볼장", "다마"],
+    "노래방": ["코노", "동전노래방", "코인노래방", "노래연습장", "룸술집"]
+}
 
 ATTRIBUTES = [
     "조용한", "분위기 좋은", "넓은", "깨끗한", "저렴한", "가성비 좋은",
@@ -56,13 +76,23 @@ ATTRIBUTES = [
     "맛있는", "유명한", "인기 많은", "숨겨진", "로컬",
     "24시간", "늦게까지 하는", "새벽",
     "아늑한", "감성", "레트로", "모던한", "힙한",
+    # 슬랭/신조어 대거 추가
+    "개맛도리", "맛도리", "존맛", "존맛탱", "JMT", "개존맛", "짱맛", "핵존맛",
+    "야르한", "미친", "폼미친", "폼미쳤다", "찢었다", "레전드", "갓성비",
+    "인스타감성", "인스타용", "사진맛집", "뷰맛집", "햇살맛집", "디저트맛집",
+    "핫플", "핫플레이스", "웨이팅", "오픈런", "나만아는", "단골", "노포감성",
+    "야장", "루프탑", "테라스", "애견동반", "주차가능", "콜키지프리", "혼밥하기좋은",
+    "가성비갑", "킹성비", "혜자", "창렬아닌", "분위기깡패", "조명맛집", "음악맛집",
+    "조용한곳", "시끌벅적한", "대화하기좋은", "소개팅", "썸남이랑", "썸녀랑",
+    "불금", "불토", "낮술", "혼술러", "낮술하기좋은", "밤샘", "2차", "3차", "막차"
 ]
 
 SUFFIXES = [
     "", " 어디야", " 추천", " 추천해줘", " 알려줘", " 찾아줘",
-    " 어디 있어", " 가고 싶어", " 위치", " 근처",
-    " 괜찮은 곳", " 맛집", " 갈만한 데",
-    " 있어?", " 알아?", " 좀", " 부탁",
+    " 어디 있어", " 가고 싶어", " 위치", " 근처", " 주변", " 가는길",
+    " 괜찮은 곳", " 맛집", " 갈만한 데", " 핫플",
+    " 있어?", " 알아?", " 좀", " 부탁", " 검색", " 검색해봐",
+    " 갈래", " 가자", " 예약", " 예약해줘", " 자리있어?"
 ]
 
 def make_bio_tags(text, entities):
@@ -96,7 +126,14 @@ def add_sample(text, entities):
             "tags": [t[1] for t in tagged],
         })
 
-sampled_places = random.sample(parsed_places, min(30000, len(parsed_places)))
+sampled_places = random.sample(parsed_places, min(50000, len(parsed_places)))
+
+def get_slang_category(cat):
+    for formal, slangs in SLANG_CATEGORIES.items():
+        if formal in cat or cat in formal:
+            if random.random() < 0.6:  # 60% 확률로 슬랭 사용
+                return random.choice(slangs)
+    return cat
 
 for row in sampled_places:
     brand = row["brand"]
@@ -106,6 +143,8 @@ for row in sampled_places:
     
     if not brand or not dong or not cat:
         continue
+        
+    cat = get_slang_category(cat)
     
     matching_aliases = [alias for alias, dongs in LOCATION_ALIASES.items() if dong in dongs]
     
@@ -131,7 +170,7 @@ for row in sampled_places:
     entities = [(0, len(sigungu), "LOC"), (len(sigungu)+1, len(sigungu)+1+len(cat), "CAT")]
     add_sample(text, entities)
     
-    if random.random() < 0.3:
+    if random.random() < 0.5:  # 속성 추가 확률 증가
         attr = random.choice(ATTRIBUTES)
         suffix = random.choice(SUFFIXES)
         text = f"{attr} {cat} {dong}{suffix}"
@@ -139,6 +178,16 @@ for row in sampled_places:
             (0, len(attr), "ATTR"),
             (len(attr)+1, len(attr)+1+len(cat), "CAT"),
             (len(attr)+1+len(cat)+1, len(attr)+1+len(cat)+1+len(dong), "LOC"),
+        ]
+        add_sample(text, entities)
+        
+        # 순서가 반대인 경우 (홍대 개맛도리 고기집)
+        loc_term = random.choice(matching_aliases) if matching_aliases and random.random() < 0.5 else dong
+        text = f"{loc_term} {attr} {cat}{suffix}"
+        entities = [
+            (0, len(loc_term), "LOC"),
+            (len(loc_term)+1, len(loc_term)+1+len(attr), "ATTR"),
+            (len(loc_term)+1+len(attr)+1, len(loc_term)+1+len(attr)+1+len(cat), "CAT"),
         ]
         add_sample(text, entities)
     
@@ -177,16 +226,37 @@ for row in sampled_places:
         add_sample(text, entities)
 
 for cat in random.sample(all_cats, min(500, len(all_cats))):
+    cat_slang = get_slang_category(cat)
     for _ in range(3):
         suffix = random.choice(SUFFIXES)
-        text = f"{cat}{suffix}"
-        entities = [(0, len(cat), "CAT")]
+        text = f"{cat_slang}{suffix}"
+        entities = [(0, len(cat_slang), "CAT")]
         add_sample(text, entities)
 
 for loc in random.sample(all_dongs + all_aliases, min(300, len(all_dongs) + len(all_aliases))):
     suffix = random.choice(SUFFIXES)
     text = f"{loc}{suffix}"
     entities = [(0, len(loc), "LOC")]
+    add_sample(text, entities)
+
+# 하드코어 슬랭 명시적 테스트셋 추가 주입 (학습 데이터)
+hardcore_samples = [
+    ("신촌 피시빵", [("신촌", "LOC"), ("피시빵", "CAT")]),
+    ("홍대 개맛도리 고기집", [("홍대", "LOC"), ("개맛도리", "ATTR"), ("고기집", "CAT")]),
+    ("연남동 야르한 스파게티", [("연남동", "LOC"), ("야르한", "ATTR"), ("스파게티", "CAT")]),
+    ("개맛도리 횟집 찾아줘", [("개맛도리", "ATTR"), ("횟집", "CAT"), ("찾아줘", "O")]),
+    ("종로 피씨방 추천", [("종로", "LOC"), ("피씨방", "CAT"), ("추천", "O")]),
+    ("피방 어디있어", [("피방", "CAT"), ("어디있어", "O")])
+]
+
+for text, entity_tuples in hardcore_samples:
+    entities = []
+    idx = 0
+    for word, tag in entity_tuples:
+        idx = text.find(word, idx)
+        if idx != -1 and tag != "O":
+            entities.append((idx, idx + len(word), tag))
+            idx += len(word)
     add_sample(text, entities)
 
 print(f"생성 완료: {len(samples):,}개 학습 샘플")
