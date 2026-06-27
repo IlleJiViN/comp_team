@@ -34,31 +34,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("[INFO] Loading BGE-M3 model for embeddings...")
-embed_model = SentenceTransformer('BAAI/bge-m3', device='cpu')
+embed_model = None
+try:
+    print("[INFO] Loading BGE-M3 model for embeddings...")
+    embed_model = SentenceTransformer('BAAI/bge-m3', device='cpu')
+except Exception as e:
+    print(f"[WARN] Could not load embedding model: {e}")
+
 
 def get_embedding(text: str):
+    if embed_model is None:
+        return np.zeros(384, dtype=np.float32)
     return embed_model.encode(text, normalize_embeddings=True)
 
 
-print("[INFO] Loading SpotSync NER model...")
 ner_model_path = "./models/spotsync-ner"
-ner_tokenizer = AutoTokenizer.from_pretrained(ner_model_path)
-ner_model = AutoModelForTokenClassification.from_pretrained(ner_model_path)
-with open(os.path.join(ner_model_path, "label_config.json"), "r", encoding="utf-8") as f:
-    label_config = json.load(f)
-label_list = label_config["label_list"]
+ner_tokenizer = None
+ner_model = None
+label_list = []
+try:
+    print("[INFO] Loading SpotSync NER model...")
+    ner_tokenizer = AutoTokenizer.from_pretrained(ner_model_path)
+    ner_model = AutoModelForTokenClassification.from_pretrained(ner_model_path)
+    with open(os.path.join(ner_model_path, "label_config.json"), "r", encoding="utf-8") as f:
+        label_config = json.load(f)
+    label_list = label_config.get("label_list", [])
+except Exception as e:
+    print(f"[WARN] Could not load NER model: {e}")
 
 # LLM 없음 - 로컬 요약만 사용
 
-from elasticsearch import Elasticsearch
+try:
+    from elasticsearch import Elasticsearch
+except Exception as e:
+    Elasticsearch = None
+    print(f"[WARN] Elasticsearch package unavailable: {e}")
 
-print("[INFO] Connecting to Elasticsearch...")
-es = Elasticsearch("http://localhost:9200", request_timeout=10)
+if Elasticsearch is not None:
+    print("[INFO] Connecting to Elasticsearch...")
+    es = Elasticsearch("http://localhost:9200", request_timeout=10)
+else:
+    es = None
 
 DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/spotsync"
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/auth/naver/login")
 def naver_login():
@@ -308,7 +332,7 @@ def calculate_midpoint(locations: List[Location]):
 
 def extract_entities(text: str):
     tokens = text.split()
-    if not tokens:
+    if not tokens or ner_tokenizer is None or ner_model is None or not label_list:
         return {"location": [], "brand": [], "category": [], "attribute": []}
     
     inputs = ner_tokenizer(tokens, is_split_into_words=True, return_tensors="pt", truncation=True, max_length=64)
@@ -669,12 +693,12 @@ async def search_rag(req: SearchQuery):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Normalize semantic scores to 0.0 ~ 0.8
+    # Normalize semantic scores to 0.0 ~ 0.5
     if final_place_scores:
         max_es_score = max(final_place_scores.values())
         if max_es_score == 0: max_es_score = 1.0
         for pid in final_place_scores:
-            final_place_scores[pid] = (final_place_scores[pid] / max_es_score) * 0.8
+            final_place_scores[pid] = (final_place_scores[pid] / max_es_score) * 0.5
 
     # --- SPOTSYNC RE-RANKING LOGIC ---
     midpoint = calculate_midpoint(req.user_locations)
@@ -694,14 +718,17 @@ async def search_rag(req: SearchQuery):
         """, (mid_lng, mid_lat))
         
         for row in cur.fetchall():
-            distances[row[0]] = float(row[1])
+            pid = row[0]
+            dist = float(row[1])
+            distances[pid] = dist
             
-        # Re-calculate score: Combine normalized semantic score + distance penalty
-        for pid in final_place_scores:
-            dist = distances.get(pid, 10000)
-            # Give up to +0.2 bonus score (so max total score is 1.0) if perfectly at midpoint
-            distance_bonus = max(0, 0.2 * (1 - (dist / 5000.0)))
+            # Re-calculate score: Combine normalized semantic score + distance penalty
             original_score = final_place_scores[pid]
+            # Apply Distance Bonus (within 10km -> 0.5 max bonus)
+            distance_bonus = 0
+            if dist <= 10000:
+                distance_bonus = max(0, 0.5 * (1 - (dist / 10000.0)))
+            
             final_place_scores[pid] = original_score + distance_bonus
             print(f"[RE-RANK] PID: {pid}, Norm ES: {original_score:.3f}, Dist: {dist:.1f}m, Bonus: +{distance_bonus:.3f}, Final: {final_place_scores[pid]:.3f}", flush=True)
 

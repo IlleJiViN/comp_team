@@ -1,4 +1,0 @@
-torch
-sentence-transformers
-tqdm
-numpy
