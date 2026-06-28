@@ -35,29 +35,13 @@ const PRESET_LOCATIONS = [
 
 const API_VERSIONS = [
   {
-    id: 'v9',
-    name: 'V9 Unified',
-    description: 'Login, rooms, local RAG',
-    baseUrl: import.meta.env.VITE_SPOTSYNC_V9_API_URL || 'http://localhost:8000',
+    id: 'v10',
+    name: 'V10 Cost-Optimized',
+    description: 'Login, rooms, local RAG (Halfvec & PG)',
+    baseUrl: import.meta.env.VITE_SPOTSYNC_V10_API_URL || 'http://localhost:8000',
     supportsAuth: true,
     supportsRooms: true,
-  },
-  {
-    id: 'legacy',
-    name: 'Legacy Local',
-    description: 'Local search only',
-    baseUrl: import.meta.env.VITE_SPOTSYNC_LEGACY_API_URL || 'http://localhost:8002',
-    supportsAuth: false,
-    supportsRooms: false,
-  },
-  {
-    id: 'vertex',
-    name: 'Vertex RAG',
-    description: 'Google Vertex AI Search',
-    baseUrl: import.meta.env.VITE_SPOTSYNC_VERTEX_API_URL || 'http://localhost:8001',
-    supportsAuth: false,
-    supportsRooms: false,
-  },
+  }
 ];
 
 const getApiVersion = (id) => API_VERSIONS.find((version) => version.id === id) || API_VERSIONS[0];
@@ -163,7 +147,9 @@ function App() {
   const [aiMessage, setAiMessage] = useState("");
   const [customLoc, setCustomLoc] = useState("");
   const [roomId, setRoomId] = useState(null);
-  const [apiVersionId, setApiVersionId] = useState(() => localStorage.getItem('spotsyncApiVersion') || 'v9');
+  const [apiVersionId, setApiVersionId] = useState(() => localStorage.getItem('spotsyncApiVersion') || 'v10');
+  const [semanticWeight, setSemanticWeight] = useState(0.8);
+  const [spatialWeight, setSpatialWeight] = useState(0.2);
   const [searchMode, setSearchMode] = useState('local');
   const [currentUser, setCurrentUser] = useState(() => {
     const saved = localStorage.getItem('currentUser');
@@ -331,7 +317,7 @@ function App() {
 
   const handleNaverLogin = async () => {
     if (!selectedApi.supportsAuth) {
-      alert('This runtime does not support social login. Select V9 Unified first.');
+      alert('This runtime does not support social login. Select V10 Cost-Optimized first.');
       return;
     }
     const urlParams = new URLSearchParams(window.location.search);
@@ -359,7 +345,7 @@ function App() {
 
   const handleKakaoLogin = async () => {
     if (!selectedApi.supportsAuth) {
-      alert('This runtime does not support social login. Select V9 Unified first.');
+      alert('This runtime does not support social login. Select V10 Cost-Optimized first.');
       return;
     }
     const urlParams = new URLSearchParams(window.location.search);
@@ -445,7 +431,9 @@ function App() {
         body: JSON.stringify({
           query,
           top_k: 5,
-          user_locations: users.map(u => ({ name: u.name, lat: u.latitude, lng: u.longitude }))
+          user_locations: users.map(u => ({ name: u.name, lat: u.latitude, lng: u.longitude })),
+          semantic_weight: semanticWeight,
+          spatial_weight: spatialWeight
         })
       });
 
@@ -777,6 +765,25 @@ function App() {
             <input type="radio" name="searchMode" value="vertex" checked={searchMode === 'vertex'} onChange={() => setSearchMode('vertex')} />
             <strong>구글 자체 RAG</strong> (Vertex AI Search)
           </label>
+        </div>
+        <div style={{ marginBottom: '1rem', padding: '1rem', background: 'var(--card-bg)', borderRadius: '12px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+            <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>유사도 가중치 (Semantic): {semanticWeight}</span>
+            <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>거리 가중치 (Spatial): {spatialWeight}</span>
+          </div>
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+            <input 
+              type="range" 
+              min="0" max="1" step="0.1" 
+              value={semanticWeight} 
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setSemanticWeight(val);
+                setSpatialWeight(parseFloat((1.0 - val).toFixed(1)));
+              }}
+              style={{ flex: 1 }}
+            />
+          </div>
         </div>
         <div className="search-input-wrapper">
           <input

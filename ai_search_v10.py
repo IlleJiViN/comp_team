@@ -34,47 +34,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+embed_model_path = "./models/bge-m3-onnx"
+embed_tokenizer = None
 embed_model = None
 try:
-    print("[INFO] Loading BGE-M3 model for embeddings...")
-    embed_model = SentenceTransformer('BAAI/bge-m3', device='cpu')
+    print("[INFO] Loading BGE-M3 ONNX model for embeddings...")
+    from optimum.onnxruntime import ORTModelForFeatureExtraction
+    embed_tokenizer = AutoTokenizer.from_pretrained(embed_model_path)
+    embed_model = ORTModelForFeatureExtraction.from_pretrained(embed_model_path, file_name="model_quantized.onnx")
+    print("[INFO] BGE-M3 ONNX model successfully loaded!")
 except Exception as e:
     print(f"[WARN] Could not load embedding model: {e}")
 
-
 def get_embedding(text: str):
     if embed_model is None:
-        return np.zeros(384, dtype=np.float32)
-    return embed_model.encode(text, normalize_embeddings=True)
+        return np.zeros(1024, dtype=np.float32)
+    import torch.nn.functional as F
+    inputs = embed_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    outputs = embed_model(**inputs)
+    # BGE-M3 uses CLS pooling
+    embeddings = outputs.last_hidden_state[:, 0, :]
+    embeddings = F.normalize(embeddings, p=2, dim=1)
+    return embeddings[0].detach().numpy()
 
 
-ner_model_path = "./models/spotsync-ner"
+ner_model_path = "./models/spotsync-ner-onnx"
 ner_tokenizer = None
 ner_model = None
 label_list = []
 try:
-    print("[INFO] Loading SpotSync NER model...")
+    print("[INFO] Loading SpotSync NER ONNX model...")
+    from optimum.onnxruntime import ORTModelForTokenClassification
     ner_tokenizer = AutoTokenizer.from_pretrained(ner_model_path)
-    ner_model = AutoModelForTokenClassification.from_pretrained(ner_model_path)
+    ner_model = ORTModelForTokenClassification.from_pretrained(ner_model_path, file_name="model_quantized.onnx")
     with open(os.path.join(ner_model_path, "label_config.json"), "r", encoding="utf-8") as f:
         label_config = json.load(f)
     label_list = label_config.get("label_list", [])
 except Exception as e:
-    print(f"[WARN] Could not load NER model: {e}")
+    print(f"[WARN] Could not load NER ONNX model: {e}")
 
 # LLM 없음 - 로컬 요약만 사용
 
-try:
-    from elasticsearch import Elasticsearch
-except Exception as e:
-    Elasticsearch = None
-    print(f"[WARN] Elasticsearch package unavailable: {e}")
-
-if Elasticsearch is not None:
-    print("[INFO] Connecting to Elasticsearch...")
-    es = Elasticsearch("http://localhost:9200", request_timeout=10)
-else:
-    es = None
+# Removed Elasticsearch dependencies
 
 DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/spotsync"
 def get_db_connection():
@@ -322,6 +323,8 @@ class SearchQuery(BaseModel):
     query: str
     top_k: int = 3
     user_locations: List[Location] = []
+    semantic_weight: float = 0.8
+    spatial_weight: float = 0.2
 
 def calculate_midpoint(locations: List[Location]):
     if not locations:
@@ -395,80 +398,65 @@ async def search_rag(req: SearchQuery):
     # Filter by Category
     es_filters = extract_filters(entities)
 
-    # 1. PostGIS Geo-Filtering (Radius search) before ES retrieval
-    midpoint = calculate_midpoint(req.user_locations)
-    nearby_place_ids = []
-    if midpoint:
-        mid_lat, mid_lng = midpoint
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # Dynamic radius expansion: 7km -> 15km -> 50km
-        for radius in [7000, 15000, 50000]:
-            cur.execute("""
-                SELECT id FROM places 
-                WHERE ST_DWithin(location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
-            """, (mid_lng, mid_lat, radius))
-            nearby_place_ids = [row[0] for row in cur.fetchall()]
-            if len(nearby_place_ids) >= 10:
-                print(f"[GEO-FILTER] Found {len(nearby_place_ids)} places within {radius}m of midpoint")
-                break
-        conn.close()
-        
-        if nearby_place_ids:
-            es_filters.append({"terms": {"place_id": nearby_place_ids}})
-        else:
-            print("[GEO-FILTER] No places found within 50km of midpoint. Skipping location filter.")
-    
-    # 1. Elasticsearch Hybrid Query (KNN + BM25)
-    should_clauses = [
-        {"match": {"name": {"query": req.query, "boost": 2.0}}},
-        {"match": {"category": {"query": req.query, "boost": 1.0}}}
-    ]
-    
-    # Location Boost
-    for loc in entities["location"]:
-        should_clauses.append({"match": {"text": {"query": loc, "boost": 3.0}}})
-    
-    # If Brand is detected, heavily boost brand match in name
-    for brand in entities["brand"]:
-        should_clauses.append({"match": {"name": {"query": brand, "boost": 5.0}}})
-    
-    # If Attribute is detected, boost text/chunk matches
-    for attr in entities["attribute"]:
-        should_clauses.append({"match": {"text": {"query": attr, "boost": 3.0}}})
+    explicit_location_requested = len(entities["location"]) > 0
 
-    body = {
-        "knn": {
-            "field": "embedding",
-            "query_vector": query_emb.tolist(),
-            "k": 50,
-            "num_candidates": 500,
-            "boost": 0.8  # Semantic Weight
-        },
-        "query": {
-            "bool": {
-                "should": should_clauses,
-                "minimum_should_match": 0
-            }
-        },
-        "size": 150,
-        "collapse": {
-            "field": "place_id"
-        }
-    }
-    print(f"DEBUG ES QUERY BODY: {json.dumps(body, ensure_ascii=False)}", flush=True)
+    # 1. PostGIS Geo-Filtering & Vector Search (V10)
+    midpoint = calculate_midpoint(req.user_locations)
     
-    if es_filters:
-        body["knn"]["filter"] = es_filters
-        body["query"]["bool"]["filter"] = es_filters
-        print(f"DEBUG ES_FILTERS ADDED: {es_filters}", flush=True)
+    conn = get_db_connection()
+    cur = conn.cursor()
     
+    query_emb_str = f"[{','.join(map(str, query_emb[:512]))}]" # Truncated to 512!
+    
+    pg_hits = []
     try:
-        res = es.options(request_timeout=15).search(index="spotsync_chunks", body=body)
+        if explicit_location_requested or not midpoint:
+            print("[V10] Global Vector Search without hard radius...")
+            cur.execute("""
+                SELECT p.id, p.name, p.category, MIN(c.embedding <=> %s::halfvec) as dist, MIN(c.embedding <=> %s::halfvec) as dist_raw
+                FROM places_chunks c
+                JOIN places p ON p.id = c.place_id
+                GROUP BY p.id, p.name, p.category
+                ORDER BY dist ASC
+                LIMIT 150
+            """, (query_emb_str, query_emb_str))
+            pg_hits = cur.fetchall()
+        else:
+            mid_lat, mid_lng = midpoint
+            for radius in [7000, 15000, 50000]:
+                print(f"[V10] Spatial-Semantic Search within {radius}m... (semantic: {req.semantic_weight}, spatial: {req.spatial_weight})")
+                cur.execute("""
+                    SELECT p.id, p.name, p.category, 
+                           MIN(%s * (c.embedding <=> %s::halfvec) + 
+                               %s * (ST_Distance(p.location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography) / %s)) as combined_score,
+                           MIN(c.embedding <=> %s::halfvec) as dist_raw
+                    FROM places_chunks c
+                    JOIN places p ON p.id = c.place_id
+                    WHERE ST_DWithin(p.location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+                    GROUP BY p.id, p.name, p.category
+                    ORDER BY combined_score ASC
+                    LIMIT 150
+                """, (req.semantic_weight, query_emb_str, req.spatial_weight, mid_lng, mid_lat, radius, query_emb_str, mid_lng, mid_lat, radius))
+                pg_hits = cur.fetchall()
+                if len(pg_hits) >= 10:
+                    break
     except Exception as e:
-        return {"error": f"Elasticsearch query failed: {e}"}
+        print(f"[ERROR] V10 DB query failed: {e}")
+    finally:
+        conn.close()
+
+    # Convert to ES hits format to maintain compatibility with the rest of the code
+    hits = []
+    for row in pg_hits:
+        hits.append({
+            "_source": {
+                "place_id": row[0],
+                "name": row[1],
+                "category": row[2]
+            },
+            "_score": max(0.0, 1.0 - float(row[3])) # cosine distance to score
+        })
         
-    hits = res['hits']['hits']
     print(f"DEBUG: Initial hits = {len(hits)}", flush=True)
     
     # --- LIVE FALLBACK MECHANISM ---
@@ -703,6 +691,12 @@ async def search_rag(req: SearchQuery):
     # --- SPOTSYNC RE-RANKING LOGIC ---
     midpoint = calculate_midpoint(req.user_locations)
     distances = {}
+    
+    # If the user explicitly requested a location (e.g., "홍대"), 
+    # we should reduce the impact of the physical distance bonus 
+    # so that the semantic/keyword match for that location takes precedence.
+    explicit_location_requested = len(entities["location"]) > 0
+
     if midpoint and final_place_scores:
         mid_lat, mid_lng = midpoint
         place_ids_tuple = tuple(final_place_scores.keys())
@@ -722,12 +716,17 @@ async def search_rag(req: SearchQuery):
             dist = float(row[1])
             distances[pid] = dist
             
-            # Re-calculate score: Combine normalized semantic score + distance penalty
             original_score = final_place_scores[pid]
-            # Apply Distance Bonus (within 10km -> 0.5 max bonus)
             distance_bonus = 0
-            if dist <= 10000:
-                distance_bonus = max(0, 0.5 * (1 - (dist / 10000.0)))
+            
+            if explicit_location_requested:
+                # Give very small distance bonus just to break ties, but don't overwhelm ES score
+                if dist <= 10000:
+                    distance_bonus = max(0, 0.1 * (1 - (dist / 10000.0)))
+            else:
+                # Normal distance bonus when user is just looking for "맛집" near them
+                if dist <= 10000:
+                    distance_bonus = max(0, 0.5 * (1 - (dist / 10000.0)))
             
             final_place_scores[pid] = original_score + distance_bonus
             print(f"[RE-RANK] PID: {pid}, Norm ES: {original_score:.3f}, Dist: {dist:.1f}m, Bonus: +{distance_bonus:.3f}, Final: {final_place_scores[pid]:.3f}", flush=True)
