@@ -763,35 +763,64 @@ async def search_rag(req: SearchQuery):
             pass
         return None
 
+    def get_travel_time_for_user(u, dest_lat, dest_lng):
+        mins = get_kakao_travel_time(u.lat, u.lng, dest_lat, dest_lng)
+        if mins is None:
+            u_dist = haversine(u.lat, u.lng, dest_lat, dest_lng)
+            routing_dist = u_dist * 1.4
+            mins = int(routing_dist / 416)
+            if mins < 1: mins = 1
+        return {"name": u.name, "minutes": mins}
+
     results = []
     context_texts = []
     
+    db_rows = []
     for pid, score in sorted_places:
         dist_m = distances.get(pid, -1)
         cur.execute("SELECT id, name, category, address, COALESCE(description, ''), latitude, longitude, COALESCE(blog_metadata, '[]'::jsonb) FROM places WHERE id = %s", (pid,))
         row = cur.fetchone()
         if row:
+            db_rows.append((score, dist_m, row))
+            
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures_list = []
+        for score, dist_m, row in db_rows:
+            db_id, name, category, address, desc, lat, lng, blog_metadata = row
+            dest_lat, dest_lng = float(lat) if lat else 0.0, float(lng) if lng else 0.0
+            
+            user_futures = []
+            for u in req.user_locations:
+                fut = executor.submit(get_travel_time_for_user, u, dest_lat, dest_lng)
+                user_futures.append(fut)
+            
+            futures_list.append({
+                "score": score,
+                "dist_m": dist_m,
+                "row": row,
+                "dest_lat": dest_lat,
+                "dest_lng": dest_lng,
+                "user_futures": user_futures
+            })
+            
+        for data in futures_list:
+            row = data["row"]
             db_id, name, category, address, desc, lat, lng, blog_metadata = row
             
             travel_times = []
-            for u in req.user_locations:
-                mins = get_kakao_travel_time(u.lat, u.lng, float(lat), float(lng))
-                if mins is None:
-                    u_dist = haversine(u.lat, u.lng, float(lat), float(lng))
-                    routing_dist = u_dist * 1.4
-                    mins = int(routing_dist / 416)
-                    if mins < 1: mins = 1
-                travel_times.append({"name": u.name, "minutes": mins})
+            for fut in data["user_futures"]:
+                travel_times.append(fut.result())
                 
             results.append({
                 "id": db_id,
                 "name": name,
                 "category": category,
                 "address": address,
-                "score": score,
-                "distance_to_midpoint_m": round(dist_m, 1) if dist_m != -1 else None,
-                "latitude": float(lat) if lat else 0.0,
-                "longitude": float(lng) if lng else 0.0,
+                "score": data["score"],
+                "distance_to_midpoint_m": round(data["dist_m"], 1) if data["dist_m"] != -1 else None,
+                "latitude": data["dest_lat"],
+                "longitude": data["dest_lng"],
                 "blog_metadata": blog_metadata,
                 "travel_times": travel_times
             })
