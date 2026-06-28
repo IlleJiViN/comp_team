@@ -5,6 +5,9 @@ SpotSync NER 모델을 Hugging Face Hub에 업로드하는 스크립트
 - ille255/spotsync-ner-onnx  : ONNX 양자화 경량 모델
 """
 
+import os
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -15,10 +18,12 @@ import os
 HF_USERNAME = "ille255"
 MODEL_NAME_NER = "spotsync-ner"
 MODEL_NAME_ONNX = "spotsync-ner-onnx"
+MODEL_NAME_BGE = "bge-m3-onnx"
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NER_DIR = os.path.join(BASE_DIR, "models", "spotsync-ner")
 ONNX_DIR = os.path.join(BASE_DIR, "models", "spotsync-ner-onnx")
+BGE_DIR = os.path.join(BASE_DIR, "models", "bge-m3-onnx")
 
 api = HfApi()
 
@@ -158,6 +163,50 @@ for token, pred in zip(tokens, predictions[1:1+len(tokens)]):
 - GitHub: [SpotSync Project](https://github.com/IlleJiViN/comp_team)
 """
 
+README_BGE = """\
+---
+language:
+- en
+license: apache-2.0
+tags:
+- embedding
+- retrieval
+- onnx
+- quantized
+library_name: sentence-transformers
+pipeline_tag: feature-extraction
+---
+
+# BGE-M3 ONNX Embedding Model
+
+Optimized ONNX version of the BGE-M3 embedding model from **bge-m3** (large multilingual embedding).
+Provides fast, CPU-friendly inference for semantic search and retrieval.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `model_quantized.onnx` | Quantized ONNX model (~570 MB) |
+| `tokenizer.json` | Tokenizer vocabulary |
+| `config.json` | Model config |
+| `ort_config.json` | ONNX Runtime config |
+
+## Usage (sentence-transformers)
+
+```python
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("ille255/bge-m3-onnx")
+emb = model.encode(["example sentence"])
+```
+
+## Performance
+- **Size**: ~570 MB (quantized)
+- **Speed**: ~10-20 ms per sentence on CPU
+
+## License
+Apache-2.0
+"""
+
 
 def upload_model(repo_id, local_dir, readme_content, description):
     print(f"\n{'='*60}")
@@ -214,9 +263,17 @@ if __name__ == "__main__":
         readme_content=README_ONNX,
         description="SpotSync NER ONNX quantized model"
     )
+    # 3. BGE-M3 ONNX embedding model
+    upload_model(
+        repo_id=f"{HF_USERNAME}/{MODEL_NAME_BGE}",
+        local_dir=BGE_DIR,
+        readme_content=README_BGE,
+        description="BGE-M3 ONNX quantized embedding model"
+    )
 
     print(f"\n{'='*60}")
     print("[DONE] All models uploaded successfully!")
     print(f"  - https://huggingface.co/{HF_USERNAME}/{MODEL_NAME_NER}")
     print(f"  - https://huggingface.co/{HF_USERNAME}/{MODEL_NAME_ONNX}")
+    print(f"  - https://huggingface.co/{HF_USERNAME}/{MODEL_NAME_BGE}")
     print(f"{'='*60}")

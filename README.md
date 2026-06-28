@@ -39,7 +39,11 @@ pip install -r requirements.txt
          ├── bge-m3-onnx/
          └── spotsync-ner-onnx/
      ```
-   - *다운로드 링크: `[팀 구글 드라이브 모델 폴더 링크 삽입]`*
+   - *다운로드 링크:*
+     - **Hugging Face 모델 허브**에서 직접 다운로드하거나 테스트할 수 있습니다:
+       - 🔗 [SpotSync NER (원본 모델)](https://huggingface.co/ille255/spotsync-ner)
+       - 🔗 [SpotSync NER ONNX (경량화 모델)](https://huggingface.co/ille255/spotsync-ner-onnx)
+       - 🔗 [BGE-M3 ONNX Embedding (경량화 텍스트 임베딩)](https://huggingface.co/ille255/bge-m3-onnx)
 
 ### 4. 데이터베이스 (PostGIS) 복원 가이드
 이 프로젝트는 **PostGIS 및 pgvector** 데이터베이스를 사용합니다. 
