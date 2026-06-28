@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   postgis:
-    image: postgis/postgis:15-3.3
+    build:
+      context: .
+      dockerfile: db.Dockerfile
     container_name: spotsync-postgis
     ports:
       - "5432:5432"

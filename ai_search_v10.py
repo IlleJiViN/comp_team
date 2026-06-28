@@ -22,6 +22,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 KAKAO_API_KEY = os.getenv("KAKAO_API_KEY")
+if KAKAO_API_KEY and "," in KAKAO_API_KEY:
+    KAKAO_API_KEY = KAKAO_API_KEY.split(",")[0].strip()
 FRONTEND_URL = "http://localhost:5173"
 
 app = FastAPI(title="SpotSync AI Search V8 (NER + RAG Streaming)")
@@ -460,7 +462,6 @@ async def search_rag(req: SearchQuery):
     print(f"DEBUG: Initial hits = {len(hits)}", flush=True)
     
     # --- LIVE FALLBACK MECHANISM ---
-    KAKAO_API_KEY = os.getenv("KAKAO_API_KEY")
     
     is_hallucination = False
     if len(hits) > 0:
@@ -510,11 +511,13 @@ async def search_rag(req: SearchQuery):
         if midpoint:
             # y is lat, x is lng
             kakao_params.update({"y": midpoint[0], "x": midpoint[1], "radius": 20000})
-
+        conn = None
         try:
-            local_res = requests.get(local_url, headers=headers, params=kakao_params, timeout=5).json()
+            res_obj = requests.get(local_url, headers=headers, params=kakao_params, timeout=5)
+            print(f"[DEBUG] Kakao API response status: {res_obj.status_code}", flush=True)
+            local_res = res_obj.json()
             docs = local_res.get("documents", [])
-            print(f"[DEBUG] Kakao retry returned {len(docs)} documents.", flush=True)
+            print(f"[DEBUG] Kakao retry returned {len(docs)} documents. Full: {local_res}", flush=True)
             
             # If Kakao query fails (0 hits), retry with just the category
             if not docs and entities.get("category"):
@@ -618,45 +621,77 @@ async def search_rag(req: SearchQuery):
                             if len(chunk) < 10: continue
                             print(f"[DEBUG] Encoding chunk {i+1}/{len(chunks)}...", flush=True)
                             emb = get_embedding(chunk)
-                            doc_body = {
-                                "place_id": pid,
-                                "name": name,
-                                "region": region_val,
-                                "category": category,
-                                "chunk_index": i,
-                                "text": chunk,
-                                "embedding": emb.tolist()
-                            }
-                            print(f"[DEBUG] Indexing chunk {i+1}/{len(chunks)} to ES...", flush=True)
-                            es.index(index="spotsync_chunks", document=doc_body)
+                            
+                            # Truncate to 512 & Normalize
+                            emb_512 = emb[:512]
+                            norm = np.linalg.norm(emb_512)
+                            if norm > 0:
+                                emb_512 = emb_512 / norm
+                            emb_512_str = f"[{','.join(map(str, emb_512))}]"
+                            
+                            print(f"[DEBUG] Indexing chunk {i+1}/{len(chunks)} to PostGIS...", flush=True)
+                            cur.execute("""
+                                INSERT INTO places_chunks (place_id, chunk_id, text, embedding)
+                                VALUES (%s, %s, %s, %s::halfvec)
+                            """, (pid, f"{pid}_{i}", chunk, emb_512_str))
+                            conn.commit()
                             print(f"[DEBUG] Chunk {i+1} done.", flush=True)
                 
-                es.indices.refresh(index="spotsync_chunks")
-                conn.close()
-                
-                # Fallback: Update nearby_place_ids and ES filter body to include newly created place IDs
-                if new_place_ids:
-                    new_pids = [item[0] for item in new_place_ids]
-                    for pid in new_pids:
-                        if pid not in nearby_place_ids:
-                            nearby_place_ids.append(pid)
-                    if es_filters:
-                        for f in es_filters:
-                            if "terms" in f and "place_id" in f["terms"]:
-                                f["terms"]["place_id"] = nearby_place_ids
-                        body["knn"]["filter"] = es_filters
-                        body["query"]["bool"]["filter"] = es_filters
-                
-                print("[FALLBACK] Indexing complete! Re-running ES query...")
-                res = es.options(request_timeout=15).search(index="spotsync_chunks", body=body)
-                hits = res['hits']['hits']
+                # Re-run DB search logic after fallback insertions
+                print("[FALLBACK] Indexing complete! Re-running DB query...", flush=True)
+                pg_hits = []
+                if explicit_location_requested or not midpoint:
+                    print("[V10 FALLBACK] Global Vector Search without hard radius...")
+                    cur.execute("""
+                        SELECT p.id, p.name, p.category, MIN(c.embedding <=> %s::halfvec) as dist, MIN(c.embedding <=> %s::halfvec) as dist_raw
+                        FROM places_chunks c
+                        JOIN places p ON p.id = c.place_id
+                        GROUP BY p.id, p.name, p.category
+                        ORDER BY dist ASC
+                        LIMIT 150
+                    """, (query_emb_str, query_emb_str))
+                    pg_hits = cur.fetchall()
+                else:
+                    mid_lat, mid_lng = midpoint
+                    for radius in [7000, 15000, 50000]:
+                        print(f"[V10 FALLBACK] Spatial-Semantic Search within {radius}m... (semantic: {req.semantic_weight}, spatial: {req.spatial_weight})")
+                        cur.execute("""
+                            SELECT p.id, p.name, p.category, 
+                                   MIN(%s * (c.embedding <=> %s::halfvec) + 
+                                       %s * (ST_Distance(p.location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography) / %s)) as combined_score,
+                                   MIN(c.embedding <=> %s::halfvec) as dist_raw
+                            FROM places_chunks c
+                            JOIN places p ON p.id = c.place_id
+                            WHERE ST_DWithin(p.location::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+                            GROUP BY p.id, p.name, p.category
+                            ORDER BY combined_score ASC
+                            LIMIT 150
+                        """, (req.semantic_weight, query_emb_str, req.spatial_weight, mid_lng, mid_lat, radius, query_emb_str, mid_lng, mid_lat, radius))
+                        pg_hits = cur.fetchall()
+                        if len(pg_hits) >= 10:
+                            break
+                            
+                hits = []
+                for row in pg_hits:
+                    hits.append({
+                        "_source": {
+                            "place_id": row[0],
+                            "name": row[1],
+                            "category": row[2]
+                        },
+                        "_score": max(0.0, 1.0 - float(row[3])) # combined_score or dist
+                    })
+                    
                 print(f"DEBUG: Fallback hits = {len(hits)}", flush=True)
                 if len(hits) > 0:
                     fallback_success = True
-                
+                    
         except Exception as e:
             print(f"[FALLBACK] Error during fallback: {e}")
             pass
+        finally:
+            if conn:
+                conn.close()
             
     # If it was a hallucination (gibberish query) and the fallback also found nothing, 
     # we should completely drop the garbage ES results to prevent them from scaling to 80 points.
