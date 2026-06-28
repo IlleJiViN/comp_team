@@ -774,6 +774,9 @@ async def search_rag(req: SearchQuery):
     print(f"DEBUG: sorted_places after cutoff = {sorted_places}", flush=True)
     
     import math
+    import asyncio
+    import aiohttp
+    from functools import lru_cache
     def haversine(lat1, lon1, lat2, lon2):
         R = 6371000
         phi1 = math.radians(lat1)
@@ -785,7 +788,8 @@ async def search_rag(req: SearchQuery):
         return R * c
 
     def get_kakao_travel_time(lat1, lon1, lat2, lon2):
-        if not KAKAO_API_KEY: return None
+        if not KAKAO_API_KEY:
+            return None
         try:
             url = "https://apis-navi.kakaomobility.com/v1/directions"
             headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
@@ -798,13 +802,18 @@ async def search_rag(req: SearchQuery):
             pass
         return None
 
+    @lru_cache(maxsize=10000)
+    def cached_travel_time(u_lat, u_lng, dest_lat, dest_lng):
+        return get_kakao_travel_time(u_lat, u_lng, dest_lat, dest_lng)
+
     def get_travel_time_for_user(u, dest_lat, dest_lng):
-        mins = get_kakao_travel_time(u.lat, u.lng, dest_lat, dest_lng)
+        mins = cached_travel_time(u.lat, u.lng, dest_lat, dest_lng)
         if mins is None:
             u_dist = haversine(u.lat, u.lng, dest_lat, dest_lng)
             routing_dist = u_dist * 1.4
             mins = int(routing_dist / 416)
-            if mins < 1: mins = 1
+            if mins < 1:
+                mins = 1
         return {"name": u.name, "minutes": mins}
 
     results = []
@@ -818,34 +827,52 @@ async def search_rag(req: SearchQuery):
         if row:
             db_rows.append((score, dist_m, row))
             
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures_list = []
-        for score, dist_m, row in db_rows:
-            db_id, name, category, address, desc, lat, lng, blog_metadata = row
-            dest_lat, dest_lng = float(lat) if lat else 0.0, float(lng) if lng else 0.0
-            
-            user_futures = []
+    # Async implementation using aiohttp for Kakao API calls
+    async def _fetch_travel_time(session, u_lat, u_lng, dest_lat, dest_lng):
+        mins = cached_travel_time(u_lat, u_lng, dest_lat, dest_lng)
+        if mins is not None:
+            return {"name": u_name, "minutes": mins}
+        # fallback to haversine if API fails
+        u_dist = haversine(u_lat, u_lng, dest_lat, dest_lng)
+        routing_dist = u_dist * 1.4
+        mins = int(routing_dist / 416)
+        if mins < 1:
+            mins = 1
+        return {"name": u_name, "minutes": mins}
+
+    async def _process_place(score, dist_m, row):
+        db_id, name, category, address, desc, lat, lng, blog_metadata = row
+        dest_lat, dest_lng = float(lat) if lat else 0.0, float(lng) if lng else 0.0
+        tasks = []
+        async with aiohttp.ClientSession() as session:
             for u in req.user_locations:
-                fut = executor.submit(get_travel_time_for_user, u, dest_lat, dest_lng)
-                user_futures.append(fut)
-            
-            futures_list.append({
-                "score": score,
-                "dist_m": dist_m,
-                "row": row,
-                "dest_lat": dest_lat,
-                "dest_lng": dest_lng,
-                "user_futures": user_futures
-            })
-            
-        for data in futures_list:
-            row = data["row"]
-            db_id, name, category, address, desc, lat, lng, blog_metadata = row
-            
-            travel_times = []
-            for fut in data["user_futures"]:
-                travel_times.append(fut.result())
+                u_name = u.name
+                tasks.append(_fetch_travel_time(session, u.lat, u.lng, dest_lat, dest_lng))
+            travel_times = await asyncio.gather(*tasks)
+        return {
+            "id": db_id,
+            "name": name,
+            "category": category,
+            "address": address,
+            "score": score,
+            "distance_to_midpoint_m": round(dist_m, 1) if dist_m != -1 else None,
+            "latitude": dest_lat,
+            "longitude": dest_lng,
+            "blog_metadata": blog_metadata,
+            "travel_times": travel_times,
+        }
+
+    async def _run_async():
+        place_tasks = []
+        for score, dist_m, row in db_rows:
+            place_tasks.append(_process_place(score, dist_m, row))
+        place_results = await asyncio.gather(*place_tasks)
+        for res in place_results:
+            results.append(res)
+            context_texts.append(f"DB ID: {res['id']} | [{res['name']}] 카테고리: {res['category']}\n설명/리뷰: {str(res.get('description',''))[:400]}")
+
+    # Execute the async pipeline
+    asyncio.run(_run_async())
                 
             results.append({
                 "id": db_id,
